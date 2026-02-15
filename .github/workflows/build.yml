@@ -16,14 +16,23 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: claudevil-x86_64-unknown-linux-musl.tar.gz
-          - os: macos-13
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact: claudevil-aarch64-unknown-linux-musl.tar.gz
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: claudevil-x86_64-apple-darwin.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: claudevil-aarch64-apple-darwin.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: claudevil-x86_64-pc-windows-msvc.zip
 
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
@@ -50,8 +59,7 @@ jobs:
 
       - name: Package (windows)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path target/${{ matrix.target }}/release/claudevil.exe -DestinationPath ${{ matrix.artifact }}
+        run: 7z a ${{ matrix.artifact }} ./target/${{ matrix.target }}/release/claudevil.exe
 
       - name: Upload to release
         env:
