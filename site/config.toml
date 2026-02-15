@@ -1,0 +1,9 @@
+base_url = "https://claudevil.dev"
+title = "claudevil"
+description = "Single-binary semantic code search. Zero dependencies. Pure Rust."
+compile_sass = true
+minify_html = true
+generate_feeds = false
+
+[markdown.highlighting]
+theme = "github-dark"

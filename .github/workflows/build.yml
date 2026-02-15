@@ -1,0 +1,89 @@
+name: Build
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-nix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build static binary
+        run: nix build .#claudevil
+
+      - name: Verify static linking
+        run: file result/bin/claudevil && ldd result/bin/claudevil || true
+
+      - name: Package
+        run: tar czf claudevil-${{ matrix.target }}.tar.gz -C result/bin claudevil
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload ${{ github.ref_name }} claudevil-${{ matrix.target }}.tar.gz --clobber
+
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build
+        run: nix build .#claudevil
+
+      - name: Package
+        run: tar czf claudevil-${{ matrix.target }}.tar.gz -C result/bin claudevil
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload ${{ github.ref_name }} claudevil-${{ matrix.target }}.tar.gz --clobber
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: arduino/setup-protoc@v3
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path target/x86_64-pc-windows-msvc/release/claudevil.exe -DestinationPath claudevil-x86_64-pc-windows-msvc.zip
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload ${{ github.ref_name }} claudevil-x86_64-pc-windows-msvc.zip --clobber

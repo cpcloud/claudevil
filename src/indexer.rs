@@ -1,0 +1,414 @@
+use std::path::Path;
+use std::time::SystemTime;
+
+use walkdir::WalkDir;
+
+use crate::chunker;
+use crate::embed::Embedder;
+use crate::error::{Error, Result};
+use crate::store::{ChunkRow, VectorStore};
+
+/// Maximum number of chunks to embed in a single batch.
+const BATCH_SIZE: usize = 64;
+
+/// Walks a directory, chunks source files, embeds them, and stores in the vector DB.
+pub struct Indexer {
+    embedder: Embedder,
+    store: VectorStore,
+}
+
+impl Indexer {
+    pub fn new(embedder: Embedder, store: VectorStore) -> Self {
+        Self { embedder, store }
+    }
+
+    /// Index all supported files under `root`.
+    pub async fn index_directory(&self, root: &Path) -> Result<()> {
+        let mut pending_rows: Vec<PendingChunk> = Vec::new();
+
+        for entry in WalkDir::new(root)
+            .follow_links(true)
+            .into_iter()
+            .filter_entry(|e| !is_hidden(e))
+        {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("walk error: {e}");
+                    continue;
+                }
+            };
+
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            let path = entry.path();
+            let language = match chunker::detect_language(path) {
+                Some(lang) => lang,
+                None => continue,
+            };
+
+            match self.collect_file_chunks(path, root, language).await {
+                Ok(chunks) => pending_rows.extend(chunks),
+                Err(e) => {
+                    tracing::warn!("failed to chunk {}: {e}", path.display());
+                    continue;
+                }
+            }
+
+            // Flush in batches to keep memory bounded
+            if pending_rows.len() >= BATCH_SIZE {
+                self.flush_batch(&mut pending_rows).await?;
+            }
+        }
+
+        // Flush remaining
+        if !pending_rows.is_empty() {
+            self.flush_batch(&mut pending_rows).await?;
+        }
+
+        let count = self.store.chunk_count().await?;
+        tracing::info!("indexing complete: {count} chunks stored");
+        Ok(())
+    }
+
+    /// Read and chunk a single file, returning pending chunks (not yet embedded).
+    async fn collect_file_chunks(
+        &self,
+        path: &Path,
+        root: &Path,
+        language: &str,
+    ) -> Result<Vec<PendingChunk>> {
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| Error::FileRead {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+
+        let rel_path = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        let last_modified = path
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Delete existing chunks for this file before re-indexing
+        self.store.delete_file(&rel_path).await?;
+
+        let chunks = chunker::chunk_file(&content, language);
+        tracing::debug!("{}: {} chunks ({})", rel_path, chunks.len(), language);
+
+        Ok(chunks
+            .into_iter()
+            .enumerate()
+            .map(|(idx, chunk)| PendingChunk {
+                file_path: rel_path.clone(),
+                chunk_id: idx as i64,
+                content: chunk.content,
+                symbol_name: chunk.symbol_name,
+                symbol_kind: chunk.symbol_kind.map(|k| k.to_string()),
+                package_name: chunk.package_name,
+                language: language.to_string(),
+                start_line: chunk.start_line as i64,
+                end_line: chunk.end_line as i64,
+                last_modified,
+            })
+            .collect())
+    }
+
+    /// Embed a batch of pending chunks and insert into the store.
+    async fn flush_batch(&self, pending: &mut Vec<PendingChunk>) -> Result<()> {
+        let batch: Vec<PendingChunk> = std::mem::take(pending);
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
+        let embeddings = self.embedder.embed_batch(texts).await?;
+
+        let rows: Vec<ChunkRow> = batch
+            .into_iter()
+            .zip(embeddings)
+            .map(|(chunk, vector)| ChunkRow {
+                file_path: chunk.file_path,
+                chunk_id: chunk.chunk_id,
+                content: chunk.content,
+                symbol_name: chunk.symbol_name,
+                symbol_kind: chunk.symbol_kind,
+                package_name: chunk.package_name,
+                language: chunk.language,
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                last_modified: chunk.last_modified,
+                vector,
+            })
+            .collect();
+
+        self.store.insert(rows).await?;
+        Ok(())
+    }
+}
+
+struct PendingChunk {
+    file_path: String,
+    chunk_id: i64,
+    content: String,
+    symbol_name: Option<String>,
+    symbol_kind: Option<String>,
+    package_name: Option<String>,
+    language: String,
+    start_line: i64,
+    end_line: i64,
+    last_modified: i64,
+}
+
+fn is_hidden(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() > 0
+        && entry
+            .file_name()
+            .to_str()
+            .is_some_and(|s| s.starts_with('.'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Create a temp directory with Go source files for testing.
+    fn setup_go_project(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("main.go"),
+            r#"package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("hello")
+}
+
+func helper() string {
+	return "help"
+}
+"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::write(
+            dir.join("pkg/server.go"),
+            r#"package server
+
+import "net/http"
+
+type Server struct {
+	addr string
+}
+
+func NewServer(addr string) *Server {
+	return &Server{addr: addr}
+}
+
+func (s *Server) Start() error {
+	return http.ListenAndServe(s.addr, nil)
+}
+"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn index_directory_indexes_go_files() {
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        setup_go_project(project_dir.path());
+
+        let embedder = Embedder::new().unwrap();
+        let store = VectorStore::new(db_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let indexer = Indexer::new(embedder, store.clone());
+
+        indexer.index_directory(project_dir.path()).await.unwrap();
+
+        let count = store.chunk_count().await.unwrap();
+        // main.go: package + import + 2 funcs = 4
+        // pkg/server.go: package + import + type + func + method = 5
+        assert!(count >= 7, "expected at least 7 chunks, got {count}");
+    }
+
+    #[tokio::test]
+    async fn indexed_files_are_searchable() {
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        setup_go_project(project_dir.path());
+
+        let embedder = Embedder::new().unwrap();
+        let store = VectorStore::new(db_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let indexer = Indexer::new(embedder.clone(), store.clone());
+
+        indexer.index_directory(project_dir.path()).await.unwrap();
+
+        // Search for "http server" — should find the Server type or Start method
+        let query_vec = embedder.embed_one("http server listening").await.unwrap();
+        let results = store.search(&query_vec, 5, None).await.unwrap();
+
+        assert!(
+            !results.is_empty(),
+            "search should return results after indexing"
+        );
+
+        // At least one result should be from server.go
+        let has_server = results.iter().any(|r| r.file_path.contains("server.go"));
+        assert!(
+            has_server,
+            "expected at least one result from server.go, got: {:?}",
+            results.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn indexing_skips_hidden_directories() {
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        // Regular file
+        std::fs::write(
+            project_dir.path().join("visible.go"),
+            "package visible\n\nfunc Visible() {}\n",
+        )
+        .unwrap();
+
+        // Hidden directory with a Go file
+        let hidden = project_dir.path().join(".hidden");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(
+            hidden.join("secret.go"),
+            "package secret\n\nfunc Secret() {}\n",
+        )
+        .unwrap();
+
+        let embedder = Embedder::new().unwrap();
+        let store = VectorStore::new(db_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let indexer = Indexer::new(embedder.clone(), store.clone());
+
+        indexer.index_directory(project_dir.path()).await.unwrap();
+
+        // visible.go should be indexed (package + func = 2 chunks)
+        // If hidden was also indexed, we'd have 4 chunks
+        let count = store.chunk_count().await.unwrap();
+        assert_eq!(
+            count, 2,
+            "only visible.go should be indexed (package + func)"
+        );
+
+        // Verify via search that no hidden file content appears
+        let query_vec = embedder.embed_one("secret function").await.unwrap();
+        let results = store.search(&query_vec, 100, None).await.unwrap();
+        for r in &results {
+            assert!(
+                !r.file_path.contains(".hidden"),
+                "hidden directory file should not be indexed: {}",
+                r.file_path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn indexing_skips_non_go_files() {
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        std::fs::write(
+            project_dir.path().join("main.go"),
+            "package main\n\nfunc main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(project_dir.path().join("README.md"), "# My Project\n").unwrap();
+        std::fs::write(project_dir.path().join("config.yaml"), "key: value\n").unwrap();
+
+        let embedder = Embedder::new().unwrap();
+        let store = VectorStore::new(db_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let indexer = Indexer::new(embedder, store.clone());
+
+        indexer.index_directory(project_dir.path()).await.unwrap();
+
+        // Only chunks from main.go should exist (package + func = 2)
+        let count = store.chunk_count().await.unwrap();
+        assert_eq!(
+            count, 2,
+            "should have indexed only main.go (package + func)"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindexing_replaces_old_chunks() {
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        // Initial file
+        std::fs::write(
+            project_dir.path().join("lib.go"),
+            "package lib\n\nfunc Original() {}\n",
+        )
+        .unwrap();
+
+        let embedder = Embedder::new().unwrap();
+        let store = VectorStore::new(db_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let indexer = Indexer::new(embedder, store.clone());
+
+        indexer.index_directory(project_dir.path()).await.unwrap();
+        let count_before = store.chunk_count().await.unwrap();
+
+        // Overwrite the file with different content
+        std::fs::write(
+            project_dir.path().join("lib.go"),
+            "package lib\n\nfunc Updated() {}\n\nfunc Extra() {}\n",
+        )
+        .unwrap();
+
+        // Re-index
+        indexer.index_directory(project_dir.path()).await.unwrap();
+        let count_after = store.chunk_count().await.unwrap();
+
+        // The file had 2 chunks (package + func), now has 3 (package + 2 funcs).
+        // Old chunks should have been deleted before re-inserting.
+        assert_eq!(count_before, 2, "original file should produce 2 chunks");
+        assert_eq!(count_after, 3, "updated file should produce 3 chunks");
+    }
+
+    #[tokio::test]
+    async fn index_empty_directory() {
+        let project_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        let embedder = Embedder::new().unwrap();
+        let store = VectorStore::new(db_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let indexer = Indexer::new(embedder, store.clone());
+
+        // Should not error on empty directory
+        indexer.index_directory(project_dir.path()).await.unwrap();
+        assert_eq!(store.chunk_count().await.unwrap(), 0);
+    }
+}

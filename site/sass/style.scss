@@ -1,0 +1,299 @@
+// claudevil — bold, dark, irreverent
+
+:root {
+    --bg: #09090b;
+    --surface: #111113;
+    --border: #1e1e22;
+    --text: #d4d4d8;
+    --text-dim: #71717a;
+    --accent: #f43f5e;
+    --accent-glow: rgba(244, 63, 94, 0.15);
+    --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+    --sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+*, *::before, *::after {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html {
+    font-size: 17px;
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.65;
+}
+
+.wrap {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 0 1.5rem;
+}
+
+// ---- Hero ----
+
+.hero {
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 2rem;
+    position: relative;
+
+    &::after {
+        content: '';
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        height: 1px;
+        background: linear-gradient(90deg, transparent, var(--border), transparent);
+    }
+}
+
+.hero-inner {
+    max-width: 800px;
+}
+
+.hero h1 {
+    font-size: clamp(4.5rem, 14vw, 11rem);
+    font-weight: 900;
+    letter-spacing: -0.04em;
+    line-height: 0.95;
+    color: #fafafa;
+    margin-bottom: 1.5rem;
+}
+
+.vil {
+    color: var(--accent);
+}
+
+.tagline {
+    font-size: clamp(1.15rem, 2.5vw, 1.6rem);
+    color: var(--text-dim);
+    line-height: 1.5;
+    margin-bottom: 3rem;
+    font-weight: 400;
+}
+
+.install-box {
+    display: inline-block;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.9rem 1.8rem;
+    transition: border-color 0.2s;
+
+    &:hover {
+        border-color: var(--accent);
+        box-shadow: 0 0 20px var(--accent-glow);
+    }
+
+    code {
+        font-family: var(--mono);
+        font-size: 1rem;
+        color: #e4e4e7;
+        letter-spacing: -0.01em;
+    }
+
+    .prompt {
+        color: var(--accent);
+        margin-right: 0.5em;
+        user-select: none;
+    }
+}
+
+// ---- Pitch ----
+
+.pitch {
+    padding: 7rem 0;
+}
+
+.big {
+    font-size: clamp(1.25rem, 2.5vw, 1.7rem);
+    line-height: 1.6;
+    color: var(--text);
+    max-width: 720px;
+
+    strong {
+        color: var(--accent);
+        font-weight: 700;
+    }
+}
+
+// ---- Features ----
+
+.features {
+    padding: 5rem 0;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1.25rem;
+
+    @media (max-width: 640px) {
+        grid-template-columns: 1fr;
+    }
+}
+
+.card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.75rem;
+    transition: border-color 0.2s, box-shadow 0.2s;
+
+    &:hover {
+        border-color: #333;
+        box-shadow: 0 2px 16px rgba(0, 0, 0, 0.3);
+    }
+
+    h3 {
+        font-size: 1.15rem;
+        font-weight: 700;
+        color: #fafafa;
+        margin-bottom: 0.5rem;
+    }
+
+    p {
+        color: var(--text-dim);
+        font-size: 0.95rem;
+        line-height: 1.55;
+    }
+}
+
+// ---- How it works ----
+
+.how {
+    padding: 5rem 0;
+    border-top: 1px solid var(--border);
+
+    h2 {
+        font-size: 2rem;
+        font-weight: 800;
+        color: #fafafa;
+        margin-bottom: 2.5rem;
+    }
+}
+
+.steps {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+
+    li {
+        display: flex;
+        align-items: flex-start;
+        gap: 1.25rem;
+    }
+}
+
+.step-num {
+    flex-shrink: 0;
+    width: 2.5rem;
+    height: 2.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-weight: 800;
+    font-size: 1rem;
+}
+
+.steps strong {
+    display: block;
+    font-size: 1.05rem;
+    color: #fafafa;
+    margin-bottom: 0.3rem;
+}
+
+.steps p {
+    color: var(--text-dim);
+    font-size: 0.95rem;
+    line-height: 1.55;
+}
+
+.steps code {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.15em 0.4em;
+}
+
+// ---- Terminal ----
+
+.terminal {
+    padding: 5rem 0;
+    border-top: 1px solid var(--border);
+
+    h2 {
+        font-size: 2rem;
+        font-weight: 800;
+        color: #fafafa;
+        margin-bottom: 2rem;
+    }
+}
+
+.terminal pre {
+    background: #0c0c0e;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.75rem;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    line-height: 1.8;
+    color: #a1a1aa;
+}
+
+.log-info {
+    color: #4ade80;
+    font-weight: 600;
+}
+
+.note {
+    margin-top: 1.25rem;
+    color: var(--text-dim);
+    font-size: 0.95rem;
+}
+
+// ---- Footer ----
+
+footer {
+    padding: 3.5rem 0;
+    border-top: 1px solid var(--border);
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 0.9rem;
+
+    a {
+        color: var(--accent);
+        text-decoration: none;
+        font-weight: 500;
+
+        &:hover {
+            text-decoration: underline;
+        }
+    }
+
+    .sep {
+        margin: 0 0.75rem;
+        opacity: 0.4;
+    }
+}

@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Format
+        run: nix develop -c cargo fmt --all -- --check
+      - name: Clippy
+        run: nix develop -c cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: nix develop -c cargo test

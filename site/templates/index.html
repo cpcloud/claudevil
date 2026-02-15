@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main>
+    <section class="hero">
+        <div class="hero-inner">
+            <h1>claude<span class="vil">vil</span></h1>
+            <p class="tagline">Semantic code search.<br>One binary. Zero bullshit.</p>
+            <div class="install-box">
+                <code><span class="prompt">$</span> claudevil /path/to/project</code>
+            </div>
+        </div>
+    </section>
+
+    <section class="pitch">
+        <div class="wrap">
+            <p class="big">
+                Stop feeding your entire codebase into context.
+                <strong>claudevil</strong> indexes your code locally, understands it semantically,
+                and gives your AI exactly the chunks it needs &mdash; nothing more.
+            </p>
+        </div>
+    </section>
+
+    <section class="features">
+        <div class="wrap">
+            <div class="grid">
+                <div class="card">
+                    <h3>Pure Rust</h3>
+                    <p>No Python. No Node. No Docker. No CUDA drivers. One static binary, runs anywhere you do.</p>
+                </div>
+                <div class="card">
+                    <h3>MCP native</h3>
+                    <p>Plugs directly into Claude Code as an MCP server. Your AI gets surgical code retrieval instead of grepping the entire repo.</p>
+                </div>
+                <div class="card">
+                    <h3>Local everything</h3>
+                    <p>Embeddings run on your CPU via candle. Your code never leaves your machine. Not even a little.</p>
+                </div>
+                <div class="card">
+                    <h3>Language-aware chunking</h3>
+                    <p>Parses Go at the declaration level &mdash; functions, methods, types, interfaces. Not dumb line splits.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="how">
+        <div class="wrap">
+            <h2>How it works</h2>
+            <ol class="steps">
+                <li>
+                    <span class="step-num">1</span>
+                    <div>
+                        <strong>Point it at your code</strong>
+                        <p>claudevil walks your directory, chunks source files by language-aware boundaries, and embeds each chunk with all-MiniLM-L6-v2.</p>
+                    </div>
+                </li>
+                <li>
+                    <span class="step-num">2</span>
+                    <div>
+                        <strong>It speaks MCP</strong>
+                        <p>Exposes a <code>search</code> tool over stdio. Claude Code calls it automatically when it needs code context.</p>
+                    </div>
+                </li>
+                <li>
+                    <span class="step-num">3</span>
+                    <div>
+                        <strong>Your AI gets smarter</strong>
+                        <p>Instead of stuffing 50k tokens of irrelevant code, your model gets the 5 most relevant functions. Faster, cheaper, better.</p>
+                    </div>
+                </li>
+            </ol>
+        </div>
+    </section>
+
+    <section class="terminal">
+        <div class="wrap">
+            <h2>30 seconds to smarter AI</h2>
+            <pre><code>$ claudevil ~/src/myproject
+  <span class="log-info">INFO</span> claudevil starting for: /home/you/src/myproject
+  <span class="log-info">INFO</span> loading embedding model...
+  <span class="log-info">INFO</span> embedding model ready
+  <span class="log-info">INFO</span> indexing complete: 847 chunks stored
+  <span class="log-info">INFO</span> MCP server starting on stdio</code></pre>
+            <p class="note">Add it to your MCP config. Forget about it. Watch your token bills drop.</p>
+        </div>
+    </section>
+
+    <footer>
+        <div class="wrap">
+            <a href="https://github.com/claudevil/claudevil">Source</a>
+            <span class="sep">&middot;</span>
+            <span>MIT License</span>
+            <span class="sep">&middot;</span>
+            <span>Built with spite and Rust</span>
+        </div>
+    </footer>
+</main>
+{% endblock %}

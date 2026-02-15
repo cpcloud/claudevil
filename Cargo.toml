@@ -1,0 +1,58 @@
+[package]
+name = "claudevil"
+version = "0.1.0"
+edition = "2024"
+description = "Single-binary MCP server providing RAG over local files"
+
+[dependencies]
+# MCP server
+rmcp = { version = "0.15", features = ["server", "macros", "transport-io"] }
+
+# Vector storage
+lancedb = "0.26"
+arrow-array = "57"
+arrow-schema = "57"
+
+# Embeddings (pure Rust via candle — no C++ / ONNX Runtime)
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+tokenizers = { version = "0.22", default-features = false, features = [
+  "fancy-regex",
+] }
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+
+# Async runtime
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "io-std",
+  "fs",
+  "sync",
+] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# File system
+walkdir = "2"
+directories = "5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 's'
