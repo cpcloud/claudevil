@@ -82,7 +82,6 @@
         src = pkgs.gitignoreSource ./.;
 
         nativeBuildInputs = with pkgs; [
-          pkgsBuildBuild.protobuf
           pkgsBuildBuild.pkg-config
           rustStdenv.cc
           rustLinker
@@ -201,7 +200,6 @@
           stdenv.cc
           llvmPackages_18.lld
           pkg-config
-          protobuf
           cacert
           deadnix
           git
