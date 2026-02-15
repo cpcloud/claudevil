@@ -39,7 +39,13 @@
     }:
     flake-utils.lib.eachDefaultSystem (localSystem:
     let
-      crossSystem = nixpkgs.lib.systems.examples.musl64 // { useLLVM = false; };
+      # Derive the musl cross-target from the build architecture so the
+      # same flake works on both x86_64 and aarch64 hosts.
+      arch = builtins.head (builtins.split "-" localSystem);
+      crossSystem = {
+        config = "${arch}-unknown-linux-musl";
+        useLLVM = false;
+      };
 
       pkgs = import nixpkgs {
         inherit localSystem crossSystem;
@@ -75,9 +81,10 @@
       };
 
       inherit (pkgs.lib) mkForce;
-    in
-    rec {
-      packages.claudevil = pkgs.naerskBuild {
+
+      # Shared naersk args for the musl cross-build. Used by both the
+      # package (no tests) and the check (with tests).
+      naerskArgs = {
         pname = "claudevil";
         src = pkgs.gitignoreSource ./.;
 
@@ -94,6 +101,9 @@
         # C++ runtime symbols (operator new, __cxa_guard_*, exceptions) resolve.
         RUSTFLAGS = "-C linker-flavor=ld.lld -C target-feature=+crt-static -L ${pkgs.stdenv.cc.cc}/${crossSystem.config}/lib";
       };
+    in
+    rec {
+      packages.claudevil = pkgs.naerskBuild naerskArgs;
 
       packages.default = packages.claudevil;
 
@@ -150,7 +160,18 @@
       };
 
       checks = {
-        inherit (packages) claudevil;
+        # Build + test with the musl cross-toolchain, then verify the
+        # resulting binary is statically linked.
+        claudevil =
+          let
+            built = pkgs.naerskBuild (naerskArgs // { doCheck = true; });
+          in
+          pkgs.pkgsBuildBuild.runCommand "claudevil-static-check" { } ''
+            ${pkgs.pkgsBuildBuild.file}/bin/file ${built}/bin/claudevil \
+              | tee /dev/stderr \
+              | grep -q "statically linked"
+            touch $out
+          '';
 
         pre-commit-check = pre-commit-hooks.lib.${localSystem}.run {
           src = ./.;
@@ -192,13 +213,11 @@
       };
 
       devShells.default = pkgs.mkShell {
-        nativeBuildInputs = with pkgs.pkgsBuildBuild; [
+        nativeBuildInputs = (with pkgs.pkgsBuildBuild; [
           rustToolchain
           actionlint
           cargo-audit
           cargo-llvm-cov
-          stdenv.cc
-          llvmPackages_18.lld
           pkg-config
           cacert
           deadnix
@@ -208,10 +227,17 @@
           taplo
           trufflehog
           zola
+        ]) ++ [
+          # Musl-targeting clang and lld — same toolchain as the nix build.
+          pkgs.rustStdenv.cc
+          pkgs.rustLinker
         ];
 
-        # Dev builds dynamically link libstdc++; point the loader at it.
-        LD_LIBRARY_PATH = "${pkgs.pkgsBuildBuild.stdenv.cc.cc.lib}/lib";
+        hardeningDisable = [ "fortify" ];
+
+        # Always target musl so cargo build/test/clippy produce static binaries.
+        CARGO_BUILD_TARGET = crossSystem.config;
+        RUSTFLAGS = "-C linker-flavor=ld.lld -C target-feature=+crt-static -L ${pkgs.stdenv.cc.cc}/${crossSystem.config}/lib";
 
         inherit (self.checks.${localSystem}.pre-commit-check) shellHook;
       };
