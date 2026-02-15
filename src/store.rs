@@ -288,6 +288,136 @@ impl VectorStore {
         Ok(())
     }
 
+    /// Find chunks whose symbol_name contains the given pattern (case-insensitive substring match).
+    pub async fn find_by_symbol(
+        &self,
+        pattern: &str,
+        kind_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let table = match *self.table.read().await {
+            Some(ref t) => t.clone(),
+            None => return Ok(Vec::new()),
+        };
+
+        // LanceDB SQL filter: symbol_name IS NOT NULL AND lower(symbol_name) LIKE '%pattern%'
+        let lower_pattern = pattern.to_lowercase();
+        let mut filter =
+            format!("symbol_name IS NOT NULL AND lower(symbol_name) LIKE '%{lower_pattern}%'");
+        if let Some(kind) = kind_filter {
+            filter.push_str(&format!(" AND symbol_kind = '{kind}'"));
+        }
+
+        let batches: Vec<RecordBatch> = table
+            .query()
+            .only_if(filter)
+            .limit(limit)
+            .select(Select::columns(&[
+                "file_path",
+                "content",
+                "symbol_name",
+                "symbol_kind",
+                "start_line",
+                "end_line",
+            ]))
+            .execute()
+            .await
+            .map_err(Error::StoreSearch)?
+            .try_collect()
+            .await
+            .map_err(Error::StoreSearch)?;
+
+        let mut results = Vec::new();
+        for batch in &batches {
+            let paths = batch
+                .column_by_name("file_path")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let contents = batch
+                .column_by_name("content")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let sym_names = batch
+                .column_by_name("symbol_name")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let sym_kinds = batch
+                .column_by_name("symbol_kind")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let start_lines = batch
+                .column_by_name("start_line")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+            let end_lines = batch
+                .column_by_name("end_line")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+
+            let (Some(paths), Some(contents), Some(start_lines), Some(end_lines)) =
+                (paths, contents, start_lines, end_lines)
+            else {
+                continue;
+            };
+
+            for row in 0..batch.num_rows() {
+                results.push(SearchResult {
+                    file_path: paths.value(row).to_string(),
+                    content: contents.value(row).to_string(),
+                    symbol_name: sym_names.and_then(|a| {
+                        if a.is_null(row) {
+                            None
+                        } else {
+                            Some(a.value(row).to_string())
+                        }
+                    }),
+                    symbol_kind: sym_kinds.and_then(|a| {
+                        if a.is_null(row) {
+                            None
+                        } else {
+                            Some(a.value(row).to_string())
+                        }
+                    }),
+                    start_line: start_lines.value(row),
+                    end_line: end_lines.value(row),
+                    distance: 0.0,
+                });
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Return distinct file paths in the index, optionally filtered by language.
+    pub async fn list_files(&self, language_filter: Option<&str>) -> Result<Vec<String>> {
+        let table = match *self.table.read().await {
+            Some(ref t) => t.clone(),
+            None => return Ok(Vec::new()),
+        };
+
+        let mut query = table.query().select(Select::columns(&["file_path"]));
+
+        if let Some(lang) = language_filter {
+            query = query.only_if(format!("language = '{lang}'"));
+        }
+
+        let batches: Vec<RecordBatch> = query
+            .execute()
+            .await
+            .map_err(Error::StoreSearch)?
+            .try_collect()
+            .await
+            .map_err(Error::StoreSearch)?;
+
+        let mut paths = std::collections::BTreeSet::new();
+        for batch in &batches {
+            if let Some(col) = batch
+                .column_by_name("file_path")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            {
+                for i in 0..col.len() {
+                    paths.insert(col.value(i).to_string());
+                }
+            }
+        }
+
+        Ok(paths.into_iter().collect())
+    }
+
     /// Count total indexed chunks.
     pub async fn chunk_count(&self) -> Result<u64> {
         let guard = self.table.read().await;
@@ -609,5 +739,268 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].symbol_name.is_none());
         assert!(results[0].symbol_kind.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // find_by_symbol tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn find_by_symbol_matches_substring() {
+        let tmp = TempDir::new().unwrap();
+        let store = VectorStore::new(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let rows = vec![
+            ChunkRow {
+                file_path: "server.go".to_string(),
+                chunk_id: 0,
+                content: "func NewServer() {}".to_string(),
+                symbol_name: Some("NewServer".to_string()),
+                symbol_kind: Some("func".to_string()),
+                package_name: Some("main".to_string()),
+                language: "go".to_string(),
+                start_line: 1,
+                end_line: 1,
+                last_modified: 1700000000,
+                vector: make_vector(1.0),
+            },
+            ChunkRow {
+                file_path: "server.go".to_string(),
+                chunk_id: 1,
+                content: "func (s *Server) Start() {}".to_string(),
+                symbol_name: Some("Server.Start".to_string()),
+                symbol_kind: Some("method".to_string()),
+                package_name: Some("main".to_string()),
+                language: "go".to_string(),
+                start_line: 3,
+                end_line: 3,
+                last_modified: 1700000000,
+                vector: make_vector(2.0),
+            },
+            ChunkRow {
+                file_path: "client.go".to_string(),
+                chunk_id: 0,
+                content: "func NewClient() {}".to_string(),
+                symbol_name: Some("NewClient".to_string()),
+                symbol_kind: Some("func".to_string()),
+                package_name: Some("main".to_string()),
+                language: "go".to_string(),
+                start_line: 1,
+                end_line: 1,
+                last_modified: 1700000000,
+                vector: make_vector(3.0),
+            },
+        ];
+        store.insert(rows).await.unwrap();
+
+        // Search for "Server" -- should match NewServer and Server.Start
+        let results = store.find_by_symbol("Server", None, 10).await.unwrap();
+        assert_eq!(results.len(), 2);
+        let names: Vec<_> = results
+            .iter()
+            .filter_map(|r| r.symbol_name.as_deref())
+            .collect();
+        assert!(names.contains(&"NewServer"));
+        assert!(names.contains(&"Server.Start"));
+    }
+
+    #[tokio::test]
+    async fn find_by_symbol_is_case_insensitive() {
+        let tmp = TempDir::new().unwrap();
+        let store = VectorStore::new(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let rows = vec![ChunkRow {
+            file_path: "handler.go".to_string(),
+            chunk_id: 0,
+            content: "func HandleRequest() {}".to_string(),
+            symbol_name: Some("HandleRequest".to_string()),
+            symbol_kind: Some("func".to_string()),
+            package_name: Some("api".to_string()),
+            language: "go".to_string(),
+            start_line: 1,
+            end_line: 1,
+            last_modified: 1700000000,
+            vector: make_vector(1.0),
+        }];
+        store.insert(rows).await.unwrap();
+
+        let results = store
+            .find_by_symbol("handlerequest", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].symbol_name.as_deref(), Some("HandleRequest"));
+    }
+
+    #[tokio::test]
+    async fn find_by_symbol_with_kind_filter() {
+        let tmp = TempDir::new().unwrap();
+        let store = VectorStore::new(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let rows = vec![
+            ChunkRow {
+                file_path: "types.go".to_string(),
+                chunk_id: 0,
+                content: "type Server struct {}".to_string(),
+                symbol_name: Some("Server".to_string()),
+                symbol_kind: Some("type".to_string()),
+                package_name: Some("main".to_string()),
+                language: "go".to_string(),
+                start_line: 1,
+                end_line: 1,
+                last_modified: 1700000000,
+                vector: make_vector(1.0),
+            },
+            ChunkRow {
+                file_path: "funcs.go".to_string(),
+                chunk_id: 0,
+                content: "func NewServer() {}".to_string(),
+                symbol_name: Some("NewServer".to_string()),
+                symbol_kind: Some("func".to_string()),
+                package_name: Some("main".to_string()),
+                language: "go".to_string(),
+                start_line: 1,
+                end_line: 1,
+                last_modified: 1700000000,
+                vector: make_vector(2.0),
+            },
+        ];
+        store.insert(rows).await.unwrap();
+
+        // Filter to type only
+        let results = store
+            .find_by_symbol("Server", Some("type"), 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].symbol_kind.as_deref(), Some("type"));
+    }
+
+    #[tokio::test]
+    async fn find_by_symbol_empty_on_no_match() {
+        let tmp = TempDir::new().unwrap();
+        let store = VectorStore::new(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let rows = vec![sample_row(
+            "a.go",
+            0,
+            "func alpha() {}",
+            "go",
+            make_vector(1.0),
+        )];
+        store.insert(rows).await.unwrap();
+
+        let results = store.find_by_symbol("nonexistent", None, 10).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_by_symbol_skips_null_names() {
+        let tmp = TempDir::new().unwrap();
+        let store = VectorStore::new(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let rows = vec![ChunkRow {
+            file_path: "test.go".to_string(),
+            chunk_id: 0,
+            content: "package main".to_string(),
+            symbol_name: None,
+            symbol_kind: None,
+            package_name: None,
+            language: "go".to_string(),
+            start_line: 1,
+            end_line: 1,
+            last_modified: 1700000000,
+            vector: make_vector(1.0),
+        }];
+        store.insert(rows).await.unwrap();
+
+        // Should not match rows with null symbol_name
+        let results = store.find_by_symbol("main", None, 10).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // list_files tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_files_returns_unique_paths() {
+        let tmp = TempDir::new().unwrap();
+        let store = VectorStore::new(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let rows = vec![
+            sample_row("main.go", 0, "package main", "go", make_vector(1.0)),
+            sample_row("main.go", 1, "func main() {}", "go", make_vector(2.0)),
+            sample_row("util.go", 0, "func util() {}", "go", make_vector(3.0)),
+            sample_row("server.go", 0, "func serve() {}", "go", make_vector(4.0)),
+        ];
+        store.insert(rows).await.unwrap();
+
+        let files = store.list_files(None).await.unwrap();
+        assert_eq!(files.len(), 3);
+        assert!(files.contains(&"main.go".to_string()));
+        assert!(files.contains(&"util.go".to_string()));
+        assert!(files.contains(&"server.go".to_string()));
+    }
+
+    #[tokio::test]
+    async fn list_files_sorted() {
+        let tmp = TempDir::new().unwrap();
+        let store = VectorStore::new(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let rows = vec![
+            sample_row("z.go", 0, "func z() {}", "go", make_vector(1.0)),
+            sample_row("a.go", 0, "func a() {}", "go", make_vector(2.0)),
+            sample_row("m.go", 0, "func m() {}", "go", make_vector(3.0)),
+        ];
+        store.insert(rows).await.unwrap();
+
+        let files = store.list_files(None).await.unwrap();
+        assert_eq!(files, vec!["a.go", "m.go", "z.go"]);
+    }
+
+    #[tokio::test]
+    async fn list_files_with_language_filter() {
+        let tmp = TempDir::new().unwrap();
+        let store = VectorStore::new(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let rows = vec![
+            sample_row("main.go", 0, "func main() {}", "go", make_vector(1.0)),
+            sample_row("lib.rs", 0, "fn lib() {}", "rust", make_vector(2.0)),
+        ];
+        store.insert(rows).await.unwrap();
+
+        let go_files = store.list_files(Some("go")).await.unwrap();
+        assert_eq!(go_files, vec!["main.go"]);
+
+        let rust_files = store.list_files(Some("rust")).await.unwrap();
+        assert_eq!(rust_files, vec!["lib.rs"]);
+    }
+
+    #[tokio::test]
+    async fn list_files_empty_store() {
+        let tmp = TempDir::new().unwrap();
+        let store = VectorStore::new(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let files = store.list_files(None).await.unwrap();
+        assert!(files.is_empty());
     }
 }

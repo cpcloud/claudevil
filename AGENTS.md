@@ -303,13 +303,23 @@ These have been repeatedly requested. Violating them wastes the user's time.
   time and sets `set -euo pipefail` automatically.
 - **Use `pkgs.python3.pkgs`** not `pkgs.python3Packages` for Python
   packages in Nix expressions.
+- **Prefer strictly better alternatives**: When choosing between tools,
+  dependencies, or actions, if option A is a drop-in replacement for option B
+  and is better on one or more dimensions (security, maintenance, performance)
+  with no downsides, choose A without asking. Don't wait for the user to
+  notice the inferior choice.
 - **Audit new deps before adding**: When the user asks to introduce a new
   third-party dependency, review its source for security issues (injection
   risks, unsafe env var handling, network calls, file writes outside
   expected paths) before integrating.
-- **Pin Actions to version tags**: In GitHub Actions workflows, always use
-  versioned tags (e.g. `@v3.93.1`) instead of named refs like `@main` or
-  `@latest`.
+- **Pin Actions to commit SHAs**: In GitHub Actions workflows, always pin
+  to full-length commit SHAs with a version comment, e.g.
+  `actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2`.
+  Never use mutable refs like `@main`, `@latest`, or even version tags
+  (tags can be force-pushed). Use `gh api repos/OWNER/REPO/git/ref/tags/vX.Y.Z`
+  to look up the SHA for a given tag. Exception: `dtolnay/rust-toolchain@stable`
+  is intentionally referenced by branch name (the branch IS the toolchain
+  selector).
 - **Avoid CI trigger phrases in commits/PRs**: GitHub Actions recognises
   `[skip ci]`, `[ci skip]`, `[no ci]`, `[skip actions]`, and
   `[actions skip]` anywhere in a commit message, PR title, or PR body and
@@ -396,9 +406,10 @@ These have been repeatedly requested. Violating them wastes the user's time.
   branch, re-read the PR title and body (`gh pr view`) and update them if
   they no longer match the actual changes. Don't wait for the user to notice
   stale descriptions.
-- **Respect native shells in CI**: Don't switch Windows CI steps to `bash`
-  just to work around argument-parsing issues. PowerShell is the native
-  shell on Windows runners; fix commands to work under PowerShell instead
+- **Respect native shells in CI**: Default to PowerShell on Windows runners.
+  Only switch Windows CI steps to `bash` when explicitly allowed in the
+  workflow (e.g. build workflows where shell compatibility is intentional).
+  For CI/test workflows, fix commands to work under PowerShell instead
   (e.g. quote arguments, use `--flag value` instead of `--flag=value`).
 - **Worktree discipline**: ALL work unrelated to the current worktree MUST
   go in a new worktree. Before starting: (1) `git fetch origin` to get the
