@@ -22,6 +22,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: step-security/rust-cache@934d90e2c411daeca7b3e18bd45712c53a6b9a75 # v2.8.1
         with:
           key: ${{ matrix.os }}
