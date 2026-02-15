@@ -308,6 +308,10 @@ These have been repeatedly requested. Violating them wastes the user's time.
   and is better on one or more dimensions (security, maintenance, performance)
   with no downsides, choose A without asking. Don't wait for the user to
   notice the inferior choice.
+- **Prefer `gh` subcommands over `gh api`**: Use specific `gh` subcommands
+  (e.g. `gh release view`, `gh pr list`, `gh repo view`) instead of raw
+  `gh api` calls. Only fall back to `gh api` when no subcommand exists for
+  the operation.
 - **Audit new deps before adding**: When the user asks to introduce a new
   third-party dependency, review its source for security issues (injection
   risks, unsafe env var handling, network calls, file writes outside
