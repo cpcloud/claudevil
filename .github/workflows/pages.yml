@@ -22,7 +22,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
 
-
       - name: Build site
         run: nix build .#site
 
