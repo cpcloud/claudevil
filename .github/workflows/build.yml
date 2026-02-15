@@ -8,82 +8,52 @@ permissions:
   contents: write
 
 jobs:
-  build-nix:
+  build:
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Build static binary
-        run: nix build .#claudevil
-
-      - name: Verify static linking
-        run: file result/bin/claudevil && ldd result/bin/claudevil || true
-
-      - name: Package
-        run: tar czf claudevil-${{ matrix.target }}.tar.gz -C result/bin claudevil
-
-      - name: Upload to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload ${{ github.ref_name }} claudevil-${{ matrix.target }}.tar.gz --clobber
-
-  build-macos:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
+            artifact: claudevil-x86_64-unknown-linux-musl.tar.gz
           - os: macos-13
             target: x86_64-apple-darwin
-          - os: macos-14
-            target: aarch64-apple-darwin
+            artifact: claudevil-x86_64-apple-darwin.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: claudevil-x86_64-pc-windows-msvc.zip
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Build
-        run: nix build .#claudevil
-
-      - name: Package
-        run: tar czf claudevil-${{ matrix.target }}.tar.gz -C result/bin claudevil
-
-      - name: Upload to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload ${{ github.ref_name }} claudevil-${{ matrix.target }}.tar.gz --clobber
-
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
+        with:
+          targets: ${{ matrix.target }}
       - uses: arduino/setup-protoc@v3
-
       - uses: Swatinem/rust-cache@v2
         with:
-          key: x86_64-pc-windows-msvc
+          key: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
 
-      - name: Package
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: tar czf ${{ matrix.artifact }} -C target/${{ matrix.target }}/release claudevil
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target/x86_64-pc-windows-msvc/release/claudevil.exe -DestinationPath claudevil-x86_64-pc-windows-msvc.zip
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/claudevil.exe -DestinationPath ${{ matrix.artifact }}
 
       - name: Upload to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload ${{ github.ref_name }} claudevil-x86_64-pc-windows-msvc.zip --clobber
+        run: gh release upload ${{ github.ref_name }} ${{ matrix.artifact }} --clobber
