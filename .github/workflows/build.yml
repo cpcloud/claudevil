@@ -1,8 +1,8 @@
 name: Build
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -66,4 +66,4 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload ${{ github.ref_name }} ${{ matrix.artifact }} --clobber
+        run: gh release upload ${{ github.event.release.tag_name }} ${{ matrix.artifact }} --clobber
