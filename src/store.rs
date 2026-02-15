@@ -1,41 +1,42 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow_array::types::Float32Type;
-use arrow_array::{
-    Array, FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator, StringArray,
-};
-use arrow_schema::{DataType, Field, Schema};
-use futures::TryStreamExt;
-use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use lancedb::{Connection, DistanceType, Table, connect};
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 use crate::embed::EMBEDDING_DIM;
 use crate::error::{Error, Result};
 
-const TABLE_NAME: &str = "code_chunks";
+const INDEX_FILE: &str = "index.usearch";
+const META_FILE: &str = "metadata.json";
 
-fn chunk_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("file_path", DataType::Utf8, false),
-        Field::new("chunk_id", DataType::Int64, false),
-        Field::new("content", DataType::Utf8, false),
-        Field::new("symbol_name", DataType::Utf8, true),
-        Field::new("symbol_kind", DataType::Utf8, true),
-        Field::new("package_name", DataType::Utf8, true),
-        Field::new("language", DataType::Utf8, false),
-        Field::new("start_line", DataType::Int64, false),
-        Field::new("end_line", DataType::Int64, false),
-        Field::new("last_modified", DataType::Int64, false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                EMBEDDING_DIM as i32,
-            ),
-            true,
-        ),
-    ]))
+// usearch::Index contains raw C++ pointers that aren't Send/Sync in Rust,
+// but the underlying C++ library is thread-safe for concurrent reads and
+// exclusive writes -- which we enforce via RwLock.
+struct SendSyncIndex(Index);
+unsafe impl Send for SendSyncIndex {}
+unsafe impl Sync for SendSyncIndex {}
+
+#[derive(Serialize, Deserialize)]
+struct Metadata {
+    next_key: u64,
+    chunks: HashMap<u64, ChunkMeta>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ChunkMeta {
+    file_path: String,
+    chunk_id: i64,
+    content: String,
+    symbol_name: Option<String>,
+    symbol_kind: Option<String>,
+    package_name: Option<String>,
+    language: String,
+    start_line: i64,
+    end_line: i64,
+    last_modified: i64,
 }
 
 /// A row ready to be inserted into the vector store.
@@ -67,54 +68,54 @@ pub struct SearchResult {
 
 #[derive(Clone)]
 pub struct VectorStore {
-    db: Connection,
-    table: Arc<RwLock<Option<Table>>>,
+    index: Arc<RwLock<SendSyncIndex>>,
+    meta: Arc<RwLock<Metadata>>,
+    db_path: PathBuf,
 }
 
 impl VectorStore {
     pub async fn new(path: &str) -> Result<Self> {
-        let db = connect(path)
-            .execute()
-            .await
-            .map_err(|e| Error::StoreConnect {
-                path: path.to_string(),
-                source: e,
-            })?;
+        let db_path = PathBuf::from(path);
+        let index_path = db_path.join(INDEX_FILE);
+        let meta_path = db_path.join(META_FILE);
 
-        let table = db.open_table(TABLE_NAME).execute().await.ok();
+        let opts = IndexOptions {
+            dimensions: EMBEDDING_DIM,
+            metric: MetricKind::Cos,
+            quantization: ScalarKind::F32,
+            ..Default::default()
+        };
+
+        let index = Index::new(&opts).map_err(|e| Error::StoreIndex(e.to_string()))?;
+
+        // Load existing index from disk if present
+        if index_path.exists() {
+            index
+                .load(index_path.to_str().unwrap_or_default())
+                .map_err(|e| Error::StoreIndex(e.to_string()))?;
+        }
+
+        // Load existing metadata or start fresh
+        let meta = if meta_path.exists() {
+            let data = tokio::fs::read_to_string(&meta_path)
+                .await
+                .map_err(|e| Error::StoreIo {
+                    context: format!("reading {}", meta_path.display()),
+                    source: e,
+                })?;
+            serde_json::from_str(&data).map_err(Error::StoreSerde)?
+        } else {
+            Metadata {
+                next_key: 0,
+                chunks: HashMap::new(),
+            }
+        };
 
         Ok(Self {
-            db,
-            table: Arc::new(RwLock::new(table)),
+            index: Arc::new(RwLock::new(SendSyncIndex(index))),
+            meta: Arc::new(RwLock::new(meta)),
+            db_path,
         })
-    }
-
-    /// Ensure the table exists, creating it if necessary.
-    async fn ensure_table(&self) -> Result<Table> {
-        {
-            let guard = self.table.read().await;
-            if let Some(ref t) = *guard {
-                return Ok(t.clone());
-            }
-        }
-
-        let mut guard = self.table.write().await;
-        if let Some(ref t) = *guard {
-            return Ok(t.clone());
-        }
-
-        let schema = chunk_schema();
-        let table = self
-            .db
-            .create_empty_table(TABLE_NAME, schema)
-            .execute()
-            .await
-            .map_err(|e| Error::StoreCreateTable {
-                table: TABLE_NAME.to_string(),
-                source: e,
-            })?;
-        *guard = Some(table.clone());
-        Ok(table)
     }
 
     /// Insert a batch of chunk rows.
@@ -123,58 +124,43 @@ impl VectorStore {
             return Ok(());
         }
 
-        let table = self.ensure_table().await?;
-        let schema = chunk_schema();
+        let mut meta = self.meta.write().await;
+        let index = self.index.write().await;
 
-        let file_paths: Vec<&str> = rows.iter().map(|r| r.file_path.as_str()).collect();
-        let chunk_ids: Vec<i64> = rows.iter().map(|r| r.chunk_id).collect();
-        let contents: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
-        let symbol_names: Vec<Option<&str>> =
-            rows.iter().map(|r| r.symbol_name.as_deref()).collect();
-        let symbol_kinds: Vec<Option<&str>> =
-            rows.iter().map(|r| r.symbol_kind.as_deref()).collect();
-        let package_names: Vec<Option<&str>> =
-            rows.iter().map(|r| r.package_name.as_deref()).collect();
-        let languages: Vec<&str> = rows.iter().map(|r| r.language.as_str()).collect();
-        let start_lines: Vec<i64> = rows.iter().map(|r| r.start_line).collect();
-        let end_lines: Vec<i64> = rows.iter().map(|r| r.end_line).collect();
-        let last_modifieds: Vec<i64> = rows.iter().map(|r| r.last_modified).collect();
+        // Reserve space in the index for the new rows
+        let new_capacity = index.0.size() + rows.len();
+        index
+            .0
+            .reserve(new_capacity)
+            .map_err(|e| Error::StoreIndex(e.to_string()))?;
 
-        let vectors: Vec<Option<Vec<Option<f32>>>> = rows
-            .iter()
-            .map(|r| Some(r.vector.iter().copied().map(Some).collect()))
-            .collect();
+        for row in rows {
+            let key = meta.next_key;
+            meta.next_key += 1;
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(file_paths)),
-                Arc::new(Int64Array::from(chunk_ids)),
-                Arc::new(StringArray::from(contents)),
-                Arc::new(StringArray::from(symbol_names)),
-                Arc::new(StringArray::from(symbol_kinds)),
-                Arc::new(StringArray::from(package_names)),
-                Arc::new(StringArray::from(languages)),
-                Arc::new(Int64Array::from(start_lines)),
-                Arc::new(Int64Array::from(end_lines)),
-                Arc::new(Int64Array::from(last_modifieds)),
-                Arc::new(
-                    FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                        vectors,
-                        EMBEDDING_DIM as i32,
-                    ),
-                ),
-            ],
-        )
-        .map_err(Error::ArrowBatch)?;
+            index
+                .0
+                .add(key, &row.vector)
+                .map_err(|e| Error::StoreIndex(e.to_string()))?;
 
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        table
-            .add(batches)
-            .execute()
-            .await
-            .map_err(Error::StoreInsert)?;
+            meta.chunks.insert(
+                key,
+                ChunkMeta {
+                    file_path: row.file_path,
+                    chunk_id: row.chunk_id,
+                    content: row.content,
+                    symbol_name: row.symbol_name,
+                    symbol_kind: row.symbol_kind,
+                    package_name: row.package_name,
+                    language: row.language,
+                    start_line: row.start_line,
+                    end_line: row.end_line,
+                    last_modified: row.last_modified,
+                },
+            );
+        }
 
+        self.persist_locked(&index, &meta).await?;
         Ok(())
     }
 
@@ -185,106 +171,73 @@ impl VectorStore {
         limit: usize,
         language_filter: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        let table = match *self.table.read().await {
-            Some(ref t) => t.clone(),
-            None => return Ok(Vec::new()),
+        let index = self.index.read().await;
+        let meta = self.meta.read().await;
+
+        if meta.chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let results = match language_filter {
+            Some(lang) => {
+                let lang = lang.to_string();
+                index
+                    .0
+                    .filtered_search(query_vec, limit, |key| {
+                        meta.chunks.get(&key).is_some_and(|c| c.language == lang)
+                    })
+                    .map_err(|e| Error::StoreIndex(e.to_string()))?
+            }
+            None => index
+                .0
+                .search(query_vec, limit)
+                .map_err(|e| Error::StoreIndex(e.to_string()))?,
         };
 
-        let mut query = table.vector_search(query_vec).map_err(Error::StoreSearch)?;
-        query = query
-            .distance_type(DistanceType::Cosine)
-            .limit(limit)
-            .select(Select::columns(&[
-                "file_path",
-                "content",
-                "symbol_name",
-                "symbol_kind",
-                "start_line",
-                "end_line",
-            ]));
-
-        if let Some(lang) = language_filter {
-            query = query.only_if(format!("language = '{lang}'"));
-        }
-
-        let batches: Vec<RecordBatch> = query
-            .execute()
-            .await
-            .map_err(Error::StoreSearch)?
-            .try_collect()
-            .await
-            .map_err(Error::StoreSearch)?;
-
-        let mut results = Vec::new();
-        for batch in &batches {
-            let paths = batch
-                .column_by_name("file_path")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let contents = batch
-                .column_by_name("content")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let sym_names = batch
-                .column_by_name("symbol_name")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let sym_kinds = batch
-                .column_by_name("symbol_kind")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let start_lines = batch
-                .column_by_name("start_line")
-                .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-            let end_lines = batch
-                .column_by_name("end_line")
-                .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-            let distances = batch
-                .column_by_name("_distance")
-                .and_then(|c| c.as_any().downcast_ref::<arrow_array::Float32Array>());
-
-            let (Some(paths), Some(contents), Some(start_lines), Some(end_lines)) =
-                (paths, contents, start_lines, end_lines)
-            else {
-                continue;
-            };
-
-            for row in 0..batch.num_rows() {
-                results.push(SearchResult {
-                    file_path: paths.value(row).to_string(),
-                    content: contents.value(row).to_string(),
-                    symbol_name: sym_names.and_then(|a| {
-                        if a.is_null(row) {
-                            None
-                        } else {
-                            Some(a.value(row).to_string())
-                        }
-                    }),
-                    symbol_kind: sym_kinds.and_then(|a| {
-                        if a.is_null(row) {
-                            None
-                        } else {
-                            Some(a.value(row).to_string())
-                        }
-                    }),
-                    start_line: start_lines.value(row),
-                    end_line: end_lines.value(row),
-                    distance: distances.map_or(0.0, |d| d.value(row)),
-                });
-            }
-        }
-
-        Ok(results)
+        Ok(results
+            .keys
+            .iter()
+            .zip(results.distances.iter())
+            .filter_map(|(&key, &dist)| {
+                let chunk = meta.chunks.get(&key)?;
+                Some(SearchResult {
+                    file_path: chunk.file_path.clone(),
+                    content: chunk.content.clone(),
+                    symbol_name: chunk.symbol_name.clone(),
+                    symbol_kind: chunk.symbol_kind.clone(),
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    distance: dist,
+                })
+            })
+            .collect())
     }
 
     /// Delete all chunks for a given file path.
     pub async fn delete_file(&self, file_path: &str) -> Result<()> {
-        let guard = self.table.read().await;
-        if let Some(ref table) = *guard {
-            table
-                .delete(&format!("file_path = '{file_path}'"))
-                .await
-                .map_err(|e| Error::StoreDelete {
-                    path: file_path.to_string(),
-                    source: e,
-                })?;
+        let mut meta = self.meta.write().await;
+        let index = self.index.write().await;
+
+        let keys_to_remove: Vec<u64> = meta
+            .chunks
+            .iter()
+            .filter(|(_, c)| c.file_path == file_path)
+            .map(|(&k, _)| k)
+            .collect();
+
+        if keys_to_remove.is_empty() {
+            return Ok(());
         }
+
+        for &key in &keys_to_remove {
+            index
+                .0
+                .remove(key)
+                .map_err(|e| Error::StoreIndex(e.to_string()))?;
+            meta.chunks.remove(&key);
+        }
+
+        self.persist_locked(&index, &meta).await?;
         Ok(())
     }
 
@@ -295,123 +248,41 @@ impl VectorStore {
         kind_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
-        let table = match *self.table.read().await {
-            Some(ref t) => t.clone(),
-            None => return Ok(Vec::new()),
-        };
-
-        // LanceDB SQL filter: symbol_name IS NOT NULL AND lower(symbol_name) LIKE '%pattern%'
+        let meta = self.meta.read().await;
         let lower_pattern = pattern.to_lowercase();
-        let mut filter =
-            format!("symbol_name IS NOT NULL AND lower(symbol_name) LIKE '%{lower_pattern}%'");
-        if let Some(kind) = kind_filter {
-            filter.push_str(&format!(" AND symbol_kind = '{kind}'"));
-        }
 
-        let batches: Vec<RecordBatch> = table
-            .query()
-            .only_if(filter)
-            .limit(limit)
-            .select(Select::columns(&[
-                "file_path",
-                "content",
-                "symbol_name",
-                "symbol_kind",
-                "start_line",
-                "end_line",
-            ]))
-            .execute()
-            .await
-            .map_err(Error::StoreSearch)?
-            .try_collect()
-            .await
-            .map_err(Error::StoreSearch)?;
-
-        let mut results = Vec::new();
-        for batch in &batches {
-            let paths = batch
-                .column_by_name("file_path")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let contents = batch
-                .column_by_name("content")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let sym_names = batch
-                .column_by_name("symbol_name")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let sym_kinds = batch
-                .column_by_name("symbol_kind")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let start_lines = batch
-                .column_by_name("start_line")
-                .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-            let end_lines = batch
-                .column_by_name("end_line")
-                .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-
-            let (Some(paths), Some(contents), Some(start_lines), Some(end_lines)) =
-                (paths, contents, start_lines, end_lines)
-            else {
-                continue;
-            };
-
-            for row in 0..batch.num_rows() {
-                results.push(SearchResult {
-                    file_path: paths.value(row).to_string(),
-                    content: contents.value(row).to_string(),
-                    symbol_name: sym_names.and_then(|a| {
-                        if a.is_null(row) {
-                            None
-                        } else {
-                            Some(a.value(row).to_string())
-                        }
-                    }),
-                    symbol_kind: sym_kinds.and_then(|a| {
-                        if a.is_null(row) {
-                            None
-                        } else {
-                            Some(a.value(row).to_string())
-                        }
-                    }),
-                    start_line: start_lines.value(row),
-                    end_line: end_lines.value(row),
-                    distance: 0.0,
-                });
-            }
-        }
+        let results: Vec<SearchResult> = meta
+            .chunks
+            .values()
+            .filter(|c| {
+                c.symbol_name
+                    .as_ref()
+                    .is_some_and(|name| name.to_lowercase().contains(&lower_pattern))
+            })
+            .filter(|c| kind_filter.is_none_or(|kind| c.symbol_kind.as_deref() == Some(kind)))
+            .take(limit)
+            .map(|c| SearchResult {
+                file_path: c.file_path.clone(),
+                content: c.content.clone(),
+                symbol_name: c.symbol_name.clone(),
+                symbol_kind: c.symbol_kind.clone(),
+                start_line: c.start_line,
+                end_line: c.end_line,
+                distance: 0.0,
+            })
+            .collect();
 
         Ok(results)
     }
 
     /// Return distinct file paths in the index, optionally filtered by language.
     pub async fn list_files(&self, language_filter: Option<&str>) -> Result<Vec<String>> {
-        let table = match *self.table.read().await {
-            Some(ref t) => t.clone(),
-            None => return Ok(Vec::new()),
-        };
-
-        let mut query = table.query().select(Select::columns(&["file_path"]));
-
-        if let Some(lang) = language_filter {
-            query = query.only_if(format!("language = '{lang}'"));
-        }
-
-        let batches: Vec<RecordBatch> = query
-            .execute()
-            .await
-            .map_err(Error::StoreSearch)?
-            .try_collect()
-            .await
-            .map_err(Error::StoreSearch)?;
+        let meta = self.meta.read().await;
 
         let mut paths = std::collections::BTreeSet::new();
-        for batch in &batches {
-            if let Some(col) = batch
-                .column_by_name("file_path")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            {
-                for i in 0..col.len() {
-                    paths.insert(col.value(i).to_string());
-                }
+        for chunk in meta.chunks.values() {
+            if language_filter.is_none_or(|lang| chunk.language == lang) {
+                paths.insert(chunk.file_path.clone());
             }
         }
 
@@ -420,14 +291,29 @@ impl VectorStore {
 
     /// Count total indexed chunks.
     pub async fn chunk_count(&self) -> Result<u64> {
-        let guard = self.table.read().await;
-        match *guard {
-            Some(ref table) => {
-                let count = table.count_rows(None).await.map_err(Error::StoreCount)?;
-                Ok(count as u64)
-            }
-            None => Ok(0),
-        }
+        let meta = self.meta.read().await;
+        Ok(meta.chunks.len() as u64)
+    }
+
+    /// Persist index and metadata to disk. Caller must hold both locks.
+    async fn persist_locked(&self, index: &SendSyncIndex, meta: &Metadata) -> Result<()> {
+        let index_path = self.db_path.join(INDEX_FILE);
+        let meta_path = self.db_path.join(META_FILE);
+
+        index
+            .0
+            .save(index_path.to_str().unwrap_or_default())
+            .map_err(|e| Error::StoreIndex(e.to_string()))?;
+
+        let json = serde_json::to_string(meta).map_err(Error::StoreSerde)?;
+        tokio::fs::write(&meta_path, json)
+            .await
+            .map_err(|e| Error::StoreIo {
+                context: format!("writing {}", meta_path.display()),
+                source: e,
+            })?;
+
+        Ok(())
     }
 }
 
@@ -438,15 +324,12 @@ mod tests {
 
     fn make_vector(seed: f32) -> Vec<f32> {
         // Create a normalized vector with a distinguishable direction.
-        // Each seed produces a different unit vector by placing weight at different positions.
         let mut v = vec![0.0f32; EMBEDDING_DIM];
         let idx = (seed.abs() as usize) % EMBEDDING_DIM;
         v[idx] = 1.0;
-        // Add some noise so vectors aren't perfectly orthogonal
         for (i, val) in v.iter_mut().enumerate() {
             *val += (i as f32 * seed * 0.001).sin() * 0.01;
         }
-        // L2 normalize
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         v.iter_mut().for_each(|x| *x /= norm);
         v
@@ -528,7 +411,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Insert 3 chunks with distinct vectors
         let v1 = make_vector(1.0);
         let v2 = make_vector(50.0);
         let v3 = make_vector(100.0);
@@ -540,11 +422,9 @@ mod tests {
         ];
         store.insert(rows).await.unwrap();
 
-        // Search with v1 — the closest result should be the alpha chunk
         let results = store.search(&v1, 3, None).await.unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].content, "func alpha() {}");
-        // The closest match should have the smallest distance
         assert!(results[0].distance < results.last().unwrap().distance);
     }
 
@@ -591,7 +471,6 @@ mod tests {
 
         assert_eq!(store.chunk_count().await.unwrap(), 2);
 
-        // Search should only return chunks from keep.go
         let results = store.search(&make_vector(3.0), 10, None).await.unwrap();
         for r in &results {
             assert_eq!(
@@ -621,7 +500,6 @@ mod tests {
         ];
         store.insert(rows).await.unwrap();
 
-        // Filter to only Go
         let results = store
             .search(&make_vector(1.0), 10, Some("go"))
             .await
@@ -629,7 +507,6 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "func goFunc() {}");
 
-        // Filter to only Rust
         let results = store
             .search(&make_vector(2.0), 10, Some("rust"))
             .await
@@ -678,11 +555,9 @@ mod tests {
             .await
             .unwrap();
 
-        // First batch
         let rows1 = vec![sample_row("a.go", 0, "func a() {}", "go", make_vector(1.0))];
         store.insert(rows1).await.unwrap();
 
-        // Second batch
         let rows2 = vec![
             sample_row("b.go", 0, "func b() {}", "go", make_vector(2.0)),
             sample_row("c.go", 0, "func c() {}", "go", make_vector(3.0)),
@@ -708,7 +583,6 @@ mod tests {
         )];
         store.insert(rows).await.unwrap();
 
-        // Deleting a file that doesn't exist should not error
         store.delete_file("does_not_exist.go").await.unwrap();
         assert_eq!(store.chunk_count().await.unwrap(), 1);
     }
@@ -795,7 +669,6 @@ mod tests {
         ];
         store.insert(rows).await.unwrap();
 
-        // Search for "Server" -- should match NewServer and Server.Start
         let results = store.find_by_symbol("Server", None, 10).await.unwrap();
         assert_eq!(results.len(), 2);
         let names: Vec<_> = results
@@ -873,7 +746,6 @@ mod tests {
         ];
         store.insert(rows).await.unwrap();
 
-        // Filter to type only
         let results = store
             .find_by_symbol("Server", Some("type"), 10)
             .await
@@ -924,7 +796,6 @@ mod tests {
         }];
         store.insert(rows).await.unwrap();
 
-        // Should not match rows with null symbol_name
         let results = store.find_by_symbol("main", None, 10).await.unwrap();
         assert!(results.is_empty());
     }
@@ -1002,5 +873,34 @@ mod tests {
 
         let files = store.list_files(None).await.unwrap();
         assert!(files.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Persistence tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn data_survives_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        {
+            let store = VectorStore::new(path).await.unwrap();
+            let rows = vec![
+                sample_row("a.go", 0, "func a() {}", "go", make_vector(1.0)),
+                sample_row("b.go", 0, "func b() {}", "go", make_vector(2.0)),
+            ];
+            store.insert(rows).await.unwrap();
+            assert_eq!(store.chunk_count().await.unwrap(), 2);
+        }
+
+        // Reopen the store from the same path
+        let store = VectorStore::new(path).await.unwrap();
+        assert_eq!(store.chunk_count().await.unwrap(), 2);
+
+        // Search should still work
+        let results = store.search(&make_vector(1.0), 1, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "func a() {}");
     }
 }

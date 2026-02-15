@@ -91,7 +91,9 @@
         hardeningDisable = [ "fortify" ];
 
         CARGO_BUILD_TARGET = crossSystem.config;
-        RUSTFLAGS = "-C linker-flavor=ld.lld -C target-feature=+crt-static";
+        # Point the linker at the cross-GCC's static libstdc++ so usearch's
+        # C++ runtime symbols (operator new, __cxa_guard_*, exceptions) resolve.
+        RUSTFLAGS = "-C linker-flavor=ld.lld -C target-feature=+crt-static -L ${pkgs.stdenv.cc.cc}/${crossSystem.config}/lib";
       };
 
       packages.default = packages.claudevil;
@@ -154,6 +156,7 @@
         pre-commit-check = pre-commit-hooks.lib.${localSystem}.run {
           src = ./.;
           hooks = {
+            actionlint.enable = true;
             statix.enable = true;
             deadnix.enable = true;
             nixpkgs-fmt.enable = true;
@@ -192,6 +195,7 @@
       devShells.default = pkgs.mkShell {
         nativeBuildInputs = with pkgs.pkgsBuildBuild; [
           rustToolchain
+          actionlint
           cargo-audit
           cargo-llvm-cov
           stdenv.cc
@@ -207,6 +211,9 @@
           trufflehog
           zola
         ];
+
+        # Dev builds dynamically link libstdc++; point the loader at it.
+        LD_LIBRARY_PATH = "${pkgs.pkgsBuildBuild.stdenv.cc.cc.lib}/lib";
 
         inherit (self.checks.${localSystem}.pre-commit-check) shellHook;
       };

@@ -18,38 +18,18 @@ pub enum Error {
     #[error("embedding returned no results")]
     EmptyEmbedding,
 
-    #[error("failed to connect to vector store at {path}")]
-    StoreConnect {
-        path: String,
+    #[error("vector store I/O error: {context}")]
+    StoreIo {
+        context: String,
         #[source]
-        source: lancedb::Error,
+        source: std::io::Error,
     },
 
-    #[error("failed to create table '{table}'")]
-    StoreCreateTable {
-        table: String,
-        #[source]
-        source: lancedb::Error,
-    },
+    #[error("vector index error: {0}")]
+    StoreIndex(String),
 
-    #[error("failed to insert chunks into vector store")]
-    StoreInsert(#[source] lancedb::Error),
-
-    #[error("vector search failed")]
-    StoreSearch(#[source] lancedb::Error),
-
-    #[error("failed to delete chunks for '{path}'")]
-    StoreDelete {
-        path: String,
-        #[source]
-        source: lancedb::Error,
-    },
-
-    #[error("failed to count rows")]
-    StoreCount(#[source] lancedb::Error),
-
-    #[error("failed to build record batch")]
-    ArrowBatch(#[source] arrow_schema::ArrowError),
+    #[error("metadata serialization error")]
+    StoreSerde(#[source] serde_json::Error),
 
     #[error("could not read file: {}", path.display())]
     FileRead {
