@@ -53,6 +53,10 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
+          # musl-tools only provides musl-gcc (C), not a C++ compiler.
+          # usearch's cxx dependency needs a C++ compiler for the musl target;
+          # the host g++ works since the runner matches the target architecture.
+          CXX: ${{ contains(matrix.target, 'musl') && 'g++' || '' }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
