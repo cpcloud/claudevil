@@ -97,7 +97,9 @@ jobs:
       - name: Verify static binary (Windows)
         if: runner.os == 'Windows'
         run: |
-          file target/${{ matrix.target }}/debug/claudevil.exe | tee /dev/stderr | grep -q "PE32+"
-          objdump -p target/${{ matrix.target }}/debug/claudevil.exe \
-            | grep "DLL Name" | tee /dev/stderr \
-            | (! grep -iE 'libstdc|libgcc|msys|cygwin|mingw')
+          file_out=$(file target/${{ matrix.target }}/debug/claudevil.exe)
+          echo "$file_out"
+          echo "$file_out" | grep -q "PE32+"
+          dll_deps=$(objdump -p target/${{ matrix.target }}/debug/claudevil.exe | grep "DLL Name")
+          echo "$dll_deps"
+          echo "$dll_deps" | (! grep -iE 'libstdc|libgcc|msys|cygwin|mingw')
