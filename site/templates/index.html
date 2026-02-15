@@ -6,19 +6,9 @@
         <div class="hero-inner">
             <h1>claude<span class="vil">vil</span></h1>
             <p class="tagline">Semantic code search.<br>One binary. Zero bullshit.</p>
-            <div class="install-box">
-                <code><span class="prompt">$</span> claudevil /path/to/project</code>
-            </div>
         </div>
-    </section>
-
-    <section class="pitch">
-        <div class="wrap">
-            <p class="big">
-                Stop feeding your entire codebase into context.
-                <strong>claudevil</strong> indexes your code locally, understands it semantically,
-                and gives your AI exactly the chunks it needs &mdash; nothing more.
-            </p>
+        <div class="scroll-hint" aria-hidden="true">
+            <span></span>
         </div>
     </section>
 
@@ -45,26 +35,58 @@
         </div>
     </section>
 
+    <section class="install" id="install">
+        <div class="wrap">
+            <h2>Install</h2>
+            <div class="install-methods">
+                <div class="install-method">
+                    <h3>Nix <span class="recommended">(recommended)</span></h3>
+                    <pre><code><span class="prompt">$</span> nix run github:cpcloud/claudevil -- /path/to/project</code></pre>
+                </div>
+                <div class="install-method">
+                    <h3>From source</h3>
+                    <pre><code><span class="prompt">$</span> cargo install --git https://github.com/cpcloud/claudevil
+<span class="prompt">$</span> claudevil /path/to/project</code></pre>
+                </div>
+                <div class="install-method">
+                    <h3>Pre-built binaries</h3>
+                    <p>Static binaries for Linux (musl) are on the <a href="https://github.com/cpcloud/claudevil/releases">releases page</a>.</p>
+                </div>
+            </div>
+            <div class="install-method">
+                <h3>Claude Code config</h3>
+                <pre><code>{
+  "mcpServers": {
+    "claudevil": {
+      "command": "claudevil",
+      "args": ["/absolute/path/to/your/project"]
+    }
+  }
+}</code></pre>
+            </div>
+        </div>
+    </section>
+
     <section class="how">
         <div class="wrap">
             <h2>How it works</h2>
             <ol class="steps">
                 <li>
-                    <span class="step-num">1</span>
+                    <svg class="step-face" viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="28" fill="#f43f5e"/><circle cx="23" cy="27" r="4" fill="#09090b"/><circle cx="41" cy="27" r="4" fill="#09090b"/></svg>
                     <div>
                         <strong>Point it at your code</strong>
-                        <p>claudevil walks your directory, chunks source files by language-aware boundaries, and embeds each chunk with all-MiniLM-L6-v2.</p>
+                        <p><code>claudevil</code> walks your directory, chunks source files by language-aware boundaries, and embeds each chunk with all-MiniLM-L6-v2.</p>
                     </div>
                 </li>
                 <li>
-                    <span class="step-num">2</span>
+                    <svg class="step-face" viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="28" fill="#f43f5e"/><circle cx="23" cy="27" r="4" fill="#09090b"/><circle cx="41" cy="27" r="4" fill="#09090b"/></svg>
                     <div>
                         <strong>It speaks MCP</strong>
                         <p>Exposes a <code>search</code> tool over stdio. Claude Code calls it automatically when it needs code context.</p>
                     </div>
                 </li>
                 <li>
-                    <span class="step-num">3</span>
+                    <svg class="step-face" viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="28" fill="#f43f5e"/><circle cx="23" cy="27" r="4" fill="#09090b"/><circle cx="41" cy="27" r="4" fill="#09090b"/></svg>
                     <div>
                         <strong>Your AI gets smarter</strong>
                         <p>Instead of stuffing 50k tokens of irrelevant code, your model gets the 5 most relevant functions. Faster, cheaper, better.</p>
@@ -89,7 +111,11 @@
 
     <footer>
         <div class="wrap">
-            <a href="https://github.com/claudevil/claudevil">Source</a>
+            <span class="pronunciation">/kl&ocirc;d&middot;vil/ &mdash; <em>rhymes with vaudeville</em></span>
+            <span class="sep">&middot;</span>
+            <a href="https://github.com/cpcloud/claudevil">GitHub</a>
+            <span class="sep">&middot;</span>
+            <a href="https://github.com/cpcloud/claudevil/releases">Releases</a>
             <span class="sep">&middot;</span>
             <span>MIT License</span>
             <span class="sep">&middot;</span>

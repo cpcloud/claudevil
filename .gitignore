@@ -30,3 +30,6 @@ debug
 .pre-commit-config.yaml
 
 .claude/settings.local.json
+
+# Zola build output
+site/public/

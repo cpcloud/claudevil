@@ -9,6 +9,259 @@
     <link rel="stylesheet" href="{{ get_url(path='style.css') }}">
 </head>
 <body>
+    <canvas id="faces" aria-hidden="true"></canvas>
     {% block content %}{% endblock %}
+    <script>
+    (function() {
+        const canvas = document.getElementById('faces');
+        const ctx = canvas.getContext('2d');
+        const MIN_COUNT = 1;
+        const MAX_COUNT = 18;
+        const RADIUS = 18;
+        const SPEED = 0.35;
+        const OPACITY = 0.07;
+        // Full density cycle takes ~45 seconds
+        const CYCLE_MS = 45000;
+        let w, h;
+        const orbs = [];
+        let startTime;
+
+        function resize() {
+            w = canvas.width = window.innerWidth;
+            h = canvas.height = window.innerHeight;
+        }
+
+        // Spawn from a random edge so the orb drifts into view
+        function spawnOrb(onscreen) {
+            const r = RADIUS + Math.random() * 8;
+            let x, y, vx, vy;
+            if (onscreen) {
+                x = r + Math.random() * (w - 2 * r);
+                y = r + Math.random() * (h - 2 * r);
+                const angle = Math.random() * Math.PI * 2;
+                vx = Math.cos(angle) * SPEED;
+                vy = Math.sin(angle) * SPEED;
+            } else {
+                const edge = Math.floor(Math.random() * 4);
+                const angle = (Math.random() - 0.5) * Math.PI * 0.6;
+                if (edge === 0) { // top
+                    x = Math.random() * w; y = -r * 2;
+                    vx = Math.sin(angle) * SPEED; vy = Math.cos(angle) * SPEED;
+                } else if (edge === 1) { // bottom
+                    x = Math.random() * w; y = h + r * 2;
+                    vx = Math.sin(angle) * SPEED; vy = -Math.cos(angle) * SPEED;
+                } else if (edge === 2) { // left
+                    x = -r * 2; y = Math.random() * h;
+                    vx = Math.cos(angle) * SPEED; vy = Math.sin(angle) * SPEED;
+                } else { // right
+                    x = w + r * 2; y = Math.random() * h;
+                    vx = -Math.cos(angle) * SPEED; vy = Math.sin(angle) * SPEED;
+                }
+            }
+            return { x, y, vx, vy, r, dying: false, eater: null, immune: 0 };
+        }
+
+        function init() {
+            resize();
+            startTime = performance.now();
+            const initial = Math.round((MIN_COUNT + MAX_COUNT) / 2);
+            for (let i = 0; i < initial; i++) {
+                orbs.push(spawnOrb(true));
+            }
+            requestAnimationFrame(tick);
+        }
+
+        const EYE_THRESHOLD = RADIUS * 2.5;
+
+        function drawOrb(o) {
+            ctx.beginPath();
+            ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(244, 63, 94, ' + OPACITY + ')';
+            ctx.fill();
+            // Eyes emerge once the orb has consumed enough
+            if (o.r > EYE_THRESHOLD) {
+                const t = Math.min(1, (o.r - EYE_THRESHOLD) / (RADIUS * 2));
+                const er = o.r * 0.14;
+                const ey = o.y - o.r * 0.12;
+                const ex = o.r * 0.32;
+                ctx.fillStyle = 'rgba(9, 9, 11, ' + (OPACITY * t) + ')';
+                ctx.beginPath();
+                ctx.arc(o.x - ex, ey, er, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.beginPath();
+                ctx.arc(o.x + ex, ey, er, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+
+        function tick(now) {
+            ctx.clearRect(0, 0, w, h);
+
+            // Sine wave oscillates target count between MIN and MAX
+            const phase = ((now - startTime) % CYCLE_MS) / CYCLE_MS * Math.PI * 2;
+            const target = Math.round(MIN_COUNT + (MAX_COUNT - MIN_COUNT) * (0.5 + 0.5 * Math.sin(phase)));
+
+            // Spawn new orbs from offscreen edges when under target
+            const alive = orbs.filter(o => !o.dying && !o.eater && o.immune <= 0).length;
+            if (alive < target) {
+                orbs.push(spawnOrb(false));
+            } else if (alive > target) {
+                // Pick the smallest non-dying, free orb to mark as dying
+                // Bigger orbs resist: probability of dying = (RADIUS / r)^2
+                const candidates = orbs.filter(o => !o.dying && !o.eater && o.immune <= 0);
+                if (candidates.length > 0) {
+                    candidates.sort((a, b) => a.r - b.r);
+                    for (const c of candidates) {
+                        const chance = Math.pow(RADIUS / c.r, 2);
+                        if (Math.random() < chance) { c.dying = true; break; }
+                    }
+                }
+            }
+            // Remove dying orbs once they've left the screen
+            for (let i = orbs.length - 1; i >= 0; i--) {
+                const o = orbs[i];
+                if (o.dying) {
+                    const offscreen = o.x < -o.r * 3 || o.x > w + o.r * 3
+                                   || o.y < -o.r * 3 || o.y > h + o.r * 3;
+                    if (offscreen) orbs.splice(i, 1);
+                }
+            }
+
+            // Tick down immunity
+            for (const o of orbs) {
+                if (o.immune > 0) o.immune--;
+            }
+
+            // Collisions: immune orbs shove others, non-immune orbs consume
+            for (let i = 0; i < orbs.length; i++) {
+                const a = orbs[i];
+                if (a.eater) continue;
+                for (let j = i + 1; j < orbs.length; j++) {
+                    const b = orbs[j];
+                    if (b.eater) continue;
+                    const dx = b.x - a.x, dy = b.y - a.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < a.r + b.r && dist > 0) {
+                        const nx = dx / dist, ny = dy / dist;
+                        if (a.immune > 0 || b.immune > 0) {
+                            // Immune orb shoves the other proportional to its area
+                            const pusher = a.immune > 0 ? a : b;
+                            const pushed = pusher === a ? b : a;
+                            const force = (pusher.r * pusher.r) / (RADIUS * RADIUS) * 0.15;
+                            const dir = pusher === a ? 1 : -1;
+                            pushed.vx += nx * dir * force;
+                            pushed.vy += ny * dir * force;
+                            // Separate overlap
+                            const overlap = (a.r + b.r - dist) / 2;
+                            a.x -= nx * overlap;
+                            a.y -= ny * overlap;
+                            b.x += nx * overlap;
+                            b.y += ny * overlap;
+                        } else {
+                            // Both vulnerable: bigger eats smaller
+                            if (a.r >= b.r) { b.eater = a; }
+                            else { a.eater = b; break; }
+                        }
+                    }
+                }
+            }
+
+            // Animate consumed orbs: pull toward eater, shrink prey, grow eater
+            const CONSUME_RATE = 0.03;
+            const PULL_STRENGTH = 0.015;
+            for (const o of orbs) {
+                if (!o.eater) continue;
+                const e = o.eater;
+                // Drift toward eater's center
+                o.x += (e.x - o.x) * PULL_STRENGTH;
+                o.y += (e.y - o.y) * PULL_STRENGTH;
+                // Transfer area from prey to eater
+                const shrink = o.r * CONSUME_RATE;
+                const oldArea = o.r * o.r;
+                o.r = Math.max(0, o.r - shrink);
+                const lostArea = oldArea - o.r * o.r;
+                e.r = Math.sqrt(e.r * e.r + lostArea);
+            }
+
+            // Remove fully consumed orbs
+            for (let i = orbs.length - 1; i >= 0; i--) {
+                if (orbs[i].eater && orbs[i].r < 0.5) orbs.splice(i, 1);
+            }
+
+            const MEGA_R = RADIUS * 4;
+            const toExplode = [];
+            for (const o of orbs) {
+                // Drag fast fragments back toward normal speed
+                const spd = Math.sqrt(o.vx * o.vx + o.vy * o.vy);
+                if (spd > SPEED * 1.2) {
+                    const drag = 0.995;
+                    o.vx *= drag;
+                    o.vy *= drag;
+                }
+                o.x += o.vx;
+                o.y += o.vy;
+                if (!o.dying && !o.eater) {
+                    if (o.r >= MEGA_R) {
+                        // Megablobs explode when their edge hits the viewport
+                        const hitWall = o.x - o.r < 0 || o.x + o.r > w
+                                     || o.y - o.r < 0 || o.y + o.r > h;
+                        if (hitWall) {
+                            o.x = Math.max(o.r, Math.min(w - o.r, o.x));
+                            o.y = Math.max(o.r, Math.min(h - o.r, o.y));
+                            toExplode.push(o);
+                        }
+                    } else {
+                        // Normal orbs wrap when fully offscreen
+                        const pad = o.r * 2;
+                        if (o.x < -pad) o.x = w + pad;
+                        else if (o.x > w + pad) o.x = -pad;
+                        if (o.y < -pad) o.y = h + pad;
+                        else if (o.y > h + pad) o.y = -pad;
+                    }
+                }
+                drawOrb(o);
+            }
+            // Megablobs shatter at the wall -- fragments scatter inward
+            for (const mega of toExplode) {
+                const totalArea = mega.r * mega.r;
+                const baseR = RADIUS + 4;
+                const count = Math.max(4, Math.round(totalArea / (baseR * baseR)));
+                // Figure out which wall was hit to bias scatter inward
+                const cx = mega.x, cy = mega.y;
+                const inwardX = cx < w / 2 ? 1 : -1;
+                const inwardY = cy < h / 2 ? 1 : -1;
+                for (let k = 0; k < count; k++) {
+                    const r = RADIUS + Math.random() * 8;
+                    const angle = (Math.PI * 2 * k / count) + (Math.random() - 0.5) * 0.6;
+                    const spd = SPEED * (8 + Math.random() * 10);
+                    let vx = Math.cos(angle) * spd;
+                    let vy = Math.sin(angle) * spd;
+                    // Bias velocity inward so fragments don't fly off the edge
+                    vx += inwardX * SPEED * 2;
+                    vy += inwardY * SPEED * 1;
+                    // Clamp spawn position inside viewport
+                    const x = Math.max(r + 2, Math.min(w - r - 2, cx + Math.cos(angle) * mega.r * 0.4));
+                    const y = Math.max(r + 2, Math.min(h - r - 2, cy + Math.sin(angle) * mega.r * 0.4));
+                    orbs.push({ x, y, vx, vy, r, dying: false, eater: null, immune: 360 });
+                }
+                const idx = orbs.indexOf(mega);
+                if (idx !== -1) orbs.splice(idx, 1);
+            }
+            requestAnimationFrame(tick);
+        }
+
+        window.addEventListener('resize', resize);
+        init();
+    })();
+
+    // Hide scroll hint once user scrolls
+    (function() {
+        const hint = document.querySelector('.scroll-hint');
+        if (!hint) return;
+        window.addEventListener('scroll', function() {
+            if (window.scrollY > 50) hint.style.opacity = '0';
+        }, { passive: true });
+    })();
+    </script>
 </body>
 </html>
