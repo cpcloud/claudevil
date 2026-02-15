@@ -97,7 +97,7 @@
       packages.default = packages.claudevil;
 
       packages.site = pkgs.pkgsBuildBuild.stdenv.mkDerivation {
-        pname = "claudevil-site";
+        name = "claudevil-site";
         src = ./site;
         nativeBuildInputs = [ pkgs.pkgsBuildBuild.zola ];
         buildPhase = "zola build";
