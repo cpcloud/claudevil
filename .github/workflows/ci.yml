@@ -89,7 +89,15 @@ jobs:
         run: file target/${{ matrix.target }}/debug/claudevil | tee /dev/stderr | grep -q "statically linked"
       - name: Verify static binary (macOS)
         if: runner.os == 'macOS'
-        run: otool -L target/${{ matrix.target }}/debug/claudevil | tee /dev/stderr | (! grep -q 'libstdc++\|libc++')
+        run: |
+          otool -L target/${{ matrix.target }}/debug/claudevil | tee /dev/stderr
+          otool -L target/${{ matrix.target }}/debug/claudevil \
+            | tail -n +2 | awk '{print $1}' \
+            | (! grep -Ev '^(/usr/lib/|/System/)')
       - name: Verify static binary (Windows)
         if: runner.os == 'Windows'
-        run: file target/${{ matrix.target }}/debug/claudevil.exe | tee /dev/stderr | grep -q "PE32"
+        run: |
+          file target/${{ matrix.target }}/debug/claudevil.exe | tee /dev/stderr | grep -q "PE32+"
+          objdump -p target/${{ matrix.target }}/debug/claudevil.exe \
+            | grep "DLL Name" | tee /dev/stderr \
+            | (! grep -iE 'libstdc|libgcc|msys|cygwin|mingw')
