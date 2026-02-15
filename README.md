@@ -56,7 +56,7 @@ Add it to your MCP config. Forget about it. Watch your token bills drop.
 1. **Walks your code** — finds source files, skips hidden dirs and non-code
 2. **Chunks by declaration** — functions, methods, types, interfaces, consts, vars (Go today, more languages coming)
 3. **Embeds locally** — all-MiniLM-L6-v2 running on your CPU via candle. Pure Rust, no ONNX Runtime, no Python
-4. **Stores in LanceDB** — embedded vector database, file-based, no separate process
+4. **Stores in usearch** — HNSW vector index with JSON metadata sidecar, file-based, no separate process
 5. **Serves over MCP** — `search` tool returns the N most relevant code chunks for any natural language query
 
 ## Stack
@@ -66,7 +66,7 @@ Add it to your MCP config. Forget about it. Watch your token bills drop.
 | Language | Rust |
 | MCP | rmcp (stdio transport) |
 | Embeddings | candle (all-MiniLM-L6-v2, pure Rust BERT inference) |
-| Vector store | LanceDB (embedded, file-based) |
+| Vector store | usearch (HNSW, C++ FFI, file-based) |
 | Binary | Static musl on Linux, universal on macOS |
 
 No Python. No Node. No Docker. No CUDA drivers. No runtime dependencies. One binary.
