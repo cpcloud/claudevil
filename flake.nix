@@ -169,7 +169,7 @@
           pkgs.pkgsBuildBuild.runCommand "claudevil-static-check" { } ''
             ${pkgs.pkgsBuildBuild.file}/bin/file ${built}/bin/claudevil \
               | tee /dev/stderr \
-              | grep -q "statically linked"
+              | grep -qE "statically linked|static-pie linked"
             touch $out
           '';
 

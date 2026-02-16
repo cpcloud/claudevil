@@ -86,7 +86,7 @@ jobs:
         run: cargo build --target ${{ matrix.target }}
       - name: Verify static binary (Linux)
         if: runner.os == 'Linux'
-        run: file target/${{ matrix.target }}/debug/claudevil | tee /dev/stderr | grep -q "statically linked"
+        run: file target/${{ matrix.target }}/debug/claudevil | tee /dev/stderr | grep -qE "statically linked|static-pie linked"
       - name: Verify static binary (macOS)
         if: runner.os == 'macOS'
         run: |
