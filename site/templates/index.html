@@ -17,7 +17,7 @@
             <div class="grid">
                 <div class="card">
                     <h3>Pure Rust</h3>
-                    <p>No Python. No Node. No Docker. No CUDA drivers. One static binary, runs anywhere you do.</p>
+                    <p>No Python. No Node. No Docker. No CUDA drivers. One binary, runs anywhere you do.</p>
                 </div>
                 <div class="card">
                     <h3>MCP native</h3>
@@ -29,7 +29,7 @@
                 </div>
                 <div class="card">
                     <h3>Language-aware chunking</h3>
-                    <p>Parses Go at the declaration level &mdash; functions, methods, types, interfaces. Not dumb line splits.</p>
+                    <p>Tree-sitter parses Go, Rust, and Python at the AST level &mdash; functions, types, traits, classes.</p>
                 </div>
             </div>
         </div>
@@ -40,17 +40,13 @@
             <h2>Install</h2>
             <div class="install-methods">
                 <div class="install-method">
-                    <h3>Nix <span class="recommended">(recommended)</span></h3>
-                    <pre><code><span class="prompt">$</span> nix run github:cpcloud/claudevil -- /path/to/project</code></pre>
-                </div>
-                <div class="install-method">
-                    <h3>From source</h3>
+                    <h3>Cargo</h3>
                     <pre><code><span class="prompt">$</span> cargo install --git https://github.com/cpcloud/claudevil
 <span class="prompt">$</span> claudevil /path/to/project</code></pre>
                 </div>
                 <div class="install-method">
-                    <h3>Pre-built binaries</h3>
-                    <p>Static binaries for Linux (musl) are on the <a href="https://github.com/cpcloud/claudevil/releases">releases page</a>.</p>
+                    <h3>Nix</h3>
+                    <pre><code><span class="prompt">$</span> nix run github:cpcloud/claudevil -- /path/to/project</code></pre>
                 </div>
             </div>
             <div class="install-method">
@@ -114,8 +110,6 @@
             <span class="pronunciation">/kl&ocirc;d&middot;vil/ &mdash; <em>rhymes with vaudeville</em></span>
             <span class="sep">&middot;</span>
             <a href="https://github.com/cpcloud/claudevil">GitHub</a>
-            <span class="sep">&middot;</span>
-            <a href="https://github.com/cpcloud/claudevil/releases">Releases</a>
             <span class="sep">&middot;</span>
             <span>MIT License</span>
             <span class="sep">&middot;</span>
