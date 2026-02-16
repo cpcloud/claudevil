@@ -32,74 +32,20 @@ jobs:
             target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-
-      # Musl targets use the Nix devShell which provides a musl-targeting
-      # clang, lld, and the matching CARGO_BUILD_TARGET / RUSTFLAGS.
       - uses: DeterminateSystems/determinate-nix-action@89ab342bd48ff7318caf8d39d6a330c7b1df8f2f # v3
-        if: contains(matrix.target, 'musl')
-
-      # Non-musl targets use the standard Rust toolchain.
-      - uses: dtolnay/rust-toolchain@stable
-        if: ${{ !contains(matrix.target, 'musl') }}
-        with:
-          targets: ${{ matrix.target }}
-          components: clippy, rustfmt
-      - uses: step-security/rust-cache@934d90e2c411daeca7b3e18bd45712c53a6b9a75 # v2.8.1
-        if: ${{ !contains(matrix.target, 'musl') }}
-        with:
-          key: ${{ matrix.target }}
 
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Clippy (musl)
-        if: contains(matrix.target, 'musl')
-        run: nix develop -c cargo clippy --all-targets -- -D warnings
       - name: Clippy
-        if: ${{ !contains(matrix.target, 'musl') }}
-        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
-      - name: Test (musl)
-        if: contains(matrix.target, 'musl')
-        run: nix develop -c cargo test
+        run: nix develop -c cargo clippy --all-targets -- -D warnings
       - name: Test
-        if: ${{ !contains(matrix.target, 'musl') }}
-        run: cargo test --target ${{ matrix.target }}
-
-      - name: Build (musl)
-        if: contains(matrix.target, 'musl')
-        run: nix develop -c cargo build
+        run: nix develop -c cargo test
       - name: Build
-        if: ${{ !contains(matrix.target, 'musl') }}
-        run: cargo build --target ${{ matrix.target }}
-      - name: Verify static binary (Linux)
-        if: runner.os == 'Linux'
+        run: nix develop -c cargo build
+      - name: Verify static binary
         run: file target/${{ matrix.target }}/debug/claudevil | tee /dev/stderr | grep -qE "statically linked|static-pie linked"
-      - name: Verify static binary (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          otool -L target/${{ matrix.target }}/debug/claudevil | tee /dev/stderr
-          otool -L target/${{ matrix.target }}/debug/claudevil \
-            | tail -n +2 | awk '{print $1}' \
-            | (! grep -Ev '^(/usr/lib/|/System/)')
-      - name: Verify static binary (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          file_out=$(file target/${{ matrix.target }}/debug/claudevil.exe)
-          echo "$file_out"
-          echo "$file_out" | grep -q "PE32+"
-          dll_deps=$(objdump -p target/${{ matrix.target }}/debug/claudevil.exe | grep "DLL Name")
-          echo "$dll_deps"
-          echo "$dll_deps" | (! grep -iE 'libstdc|libgcc|msys|cygwin|mingw')

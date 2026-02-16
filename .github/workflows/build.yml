@@ -19,55 +19,20 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact: claudevil-aarch64-unknown-linux-musl.tar.gz
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            artifact: claudevil-x86_64-apple-darwin.tar.gz
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: claudevil-aarch64-apple-darwin.tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: claudevil-x86_64-pc-windows-msvc.zip
 
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-
-      # Musl targets use the Nix devShell which provides a musl-targeting
-      # clang, lld, and the matching CARGO_BUILD_TARGET / RUSTFLAGS.
       - uses: DeterminateSystems/determinate-nix-action@89ab342bd48ff7318caf8d39d6a330c7b1df8f2f # v3
-        if: contains(matrix.target, 'musl')
 
-      # Non-musl targets use the standard Rust toolchain.
-      - uses: dtolnay/rust-toolchain@stable
-        if: ${{ !contains(matrix.target, 'musl') }}
-        with:
-          targets: ${{ matrix.target }}
-      - uses: step-security/rust-cache@934d90e2c411daeca7b3e18bd45712c53a6b9a75 # v2.8.1
-        if: ${{ !contains(matrix.target, 'musl') }}
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build (musl)
-        if: contains(matrix.target, 'musl')
-        run: nix develop -c cargo build --release
       - name: Build
-        if: ${{ !contains(matrix.target, 'musl') }}
-        run: cargo build --release --target ${{ matrix.target }}
+        run: nix develop -c cargo build --release
 
-      - name: Package (unix)
-        if: runner.os != 'Windows'
+      - name: Package
         run: tar czf ${{ matrix.artifact }} -C target/${{ matrix.target }}/release claudevil
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        run: 7z a ${{ matrix.artifact }} ./target/${{ matrix.target }}/release/claudevil.exe
 
       - name: Upload to release
         env:
