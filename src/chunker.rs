@@ -1,333 +1,345 @@
-use std::fmt;
-use std::path::Path;
+use std::collections::HashSet;
+
+use tree_sitter::{Language, Node, Parser};
+
+use crate::config::Config;
+use crate::error::{Error, Result};
 
 /// A contiguous chunk of source code with metadata.
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub content: String,
     pub symbol_name: Option<String>,
-    pub symbol_kind: Option<SymbolKind>,
-    pub package_name: Option<String>,
+    pub symbol_kind: Option<String>,
     pub start_line: usize, // 1-indexed
     pub end_line: usize,   // 1-indexed, inclusive
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SymbolKind {
-    Package,
-    Import,
-    Function,
-    Method,
-    Type,
-    Interface,
-    Const,
-    Var,
+/// A loaded language grammar with its chunking configuration.
+struct LoadedLanguage {
+    language: Language,
+    chunk_on: HashSet<String>,
 }
 
-impl fmt::Display for SymbolKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Package => write!(f, "package"),
-            Self::Import => write!(f, "import"),
-            Self::Function => write!(f, "func"),
-            Self::Method => write!(f, "method"),
-            Self::Type => write!(f, "type"),
-            Self::Interface => write!(f, "interface"),
-            Self::Const => write!(f, "const"),
-            Self::Var => write!(f, "var"),
+/// Tree-sitter based chunker using natively compiled grammars.
+pub struct TreeSitterChunker {
+    languages: Vec<(String, LoadedLanguage)>,
+}
+
+impl TreeSitterChunker {
+    /// Create a chunker with all configured languages loaded.
+    pub fn new(config: &Config) -> Result<Self> {
+        let mut languages = Vec::new();
+
+        for (name, lang_config) in &config.lang {
+            let language = native_language(&lang_config.grammar).ok_or_else(|| {
+                Error::Config(format!(
+                    "unknown grammar '{}' for language '{name}' -- \
+                     only built-in grammars are supported: \
+                     tree-sitter-go, tree-sitter-rust, tree-sitter-python",
+                    lang_config.grammar
+                ))
+            })?;
+
+            let chunk_on: HashSet<String> = lang_config
+                .chunk_on
+                .as_ref()
+                .map(|v| v.iter().cloned().collect())
+                .unwrap_or_default();
+
+            languages.push((name.clone(), LoadedLanguage { language, chunk_on }));
         }
+
+        Ok(Self { languages })
+    }
+
+    /// Chunk source code for a given language.
+    pub fn chunk_file(&self, source: &str, lang_name: &str) -> Result<Vec<Chunk>> {
+        let loaded = self
+            .languages
+            .iter()
+            .find(|(name, _)| name == lang_name)
+            .map(|(_, loaded)| loaded)
+            .ok_or_else(|| {
+                Error::TreeSitter(format!("no grammar loaded for language '{lang_name}'"))
+            })?;
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&loaded.language)
+            .map_err(|e| Error::TreeSitter(format!("set_language failed: {e}")))?;
+
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| Error::TreeSitter("parsing returned no tree".to_string()))?;
+
+        let source_bytes = source.as_bytes();
+        let mut chunks = Vec::new();
+        collect_chunks(
+            tree.root_node(),
+            source_bytes,
+            &loaded.chunk_on,
+            lang_name,
+            &mut chunks,
+        );
+
+        Ok(chunks)
     }
 }
 
-/// Detect language from file extension. Returns None for unsupported languages.
-pub fn detect_language(path: &Path) -> Option<&'static str> {
-    match path.extension()?.to_str()? {
-        "go" => Some("go"),
+/// Map a grammar name to its natively compiled Language.
+fn native_language(grammar: &str) -> Option<Language> {
+    match grammar {
+        "tree-sitter-go" => Some(tree_sitter_go::LANGUAGE.into()),
+        "tree-sitter-rust" => Some(tree_sitter_rust::LANGUAGE.into()),
+        "tree-sitter-python" => Some(tree_sitter_python::LANGUAGE.into()),
         _ => None,
     }
 }
 
-/// Chunk a file based on its detected language.
-pub fn chunk_file(source: &str, language: &str) -> Vec<Chunk> {
-    match language {
-        "go" => chunk_go(source),
-        _ => Vec::new(),
+/// Recursively walk the AST and extract chunks for matching node kinds.
+fn collect_chunks(
+    node: Node<'_>,
+    source: &[u8],
+    chunk_on: &HashSet<String>,
+    lang_name: &str,
+    chunks: &mut Vec<Chunk>,
+) {
+    if chunk_on.contains(node.kind()) {
+        let content = node.utf8_text(source).unwrap_or("").to_string();
+
+        // Prepend doc comments from preceding siblings
+        let content = prepend_comments(node, source, &content);
+
+        let symbol_name = extract_symbol_name(node, source, lang_name);
+        let start_line = node.start_position().row + 1;
+        let end_line = node.end_position().row + 1;
+
+        chunks.push(Chunk {
+            content,
+            symbol_name,
+            symbol_kind: Some(node.kind().to_string()),
+            start_line,
+            end_line,
+        });
+    }
+
+    // Recurse into children (nested matches produce separate chunks)
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_chunks(child, source, chunk_on, lang_name, chunks);
     }
 }
 
-/// Go-aware chunking: extracts top-level declarations as coherent chunks.
-fn chunk_go(source: &str) -> Vec<Chunk> {
-    let lines: Vec<&str> = source.lines().collect();
-    let mut chunks = Vec::new();
-    let mut package_name: Option<String> = None;
-    let mut i = 0;
-
-    while i < lines.len() {
-        // Skip blank lines
-        if lines[i].trim().is_empty() {
-            i += 1;
-            continue;
-        }
-
-        // Collect preceding comment block
-        let comment_start = i;
-        while i < lines.len() && is_comment_line(lines[i]) {
-            i += 1;
-        }
-
-        if i >= lines.len() {
+/// Collect comment text from preceding siblings and prepend to content.
+fn prepend_comments(node: Node<'_>, source: &[u8], content: &str) -> String {
+    let mut comments = Vec::new();
+    let mut sibling = node.prev_sibling();
+    while let Some(sib) = sibling {
+        if sib.kind() == "comment" || sib.kind() == "line_comment" || sib.kind() == "block_comment"
+        {
+            if let Ok(text) = sib.utf8_text(source) {
+                comments.push(text.to_string());
+            }
+            sibling = sib.prev_sibling();
+        } else {
             break;
         }
-
-        let decl_start = if i > comment_start { comment_start } else { i };
-
-        let trimmed = lines[i].trim();
-
-        if trimmed.starts_with("package ") {
-            if let Some(name) = trimmed
-                .strip_prefix("package ")
-                .map(|s| s.trim().to_string())
-            {
-                package_name = Some(name.clone());
-                chunks.push(Chunk {
-                    content: join_lines(&lines, decl_start, i),
-                    symbol_name: Some(name),
-                    symbol_kind: Some(SymbolKind::Package),
-                    package_name: package_name.clone(),
-                    start_line: decl_start + 1,
-                    end_line: i + 1,
-                });
-            }
-            i += 1;
-        } else if trimmed.starts_with("import") {
-            let end = if trimmed.contains('(') {
-                find_closing(&lines, i, '(', ')')
-            } else {
-                i
-            };
-            chunks.push(Chunk {
-                content: join_lines(&lines, decl_start, end),
-                symbol_name: None,
-                symbol_kind: Some(SymbolKind::Import),
-                package_name: package_name.clone(),
-                start_line: decl_start + 1,
-                end_line: end + 1,
-            });
-            i = end + 1;
-        } else if trimmed.starts_with("func ") {
-            let (name, kind) = parse_func_signature(trimmed);
-            let end = if source_contains_brace(&lines, i) {
-                find_closing(&lines, i, '{', '}')
-            } else {
-                // Function type or forward declaration — single line
-                i
-            };
-            chunks.push(Chunk {
-                content: join_lines(&lines, decl_start, end),
-                symbol_name: Some(name),
-                symbol_kind: Some(kind),
-                package_name: package_name.clone(),
-                start_line: decl_start + 1,
-                end_line: end + 1,
-            });
-            i = end + 1;
-        } else if trimmed.starts_with("type ") {
-            let (name, kind) = parse_type_declaration(trimmed);
-            let end = if source_contains_brace(&lines, i) {
-                find_closing(&lines, i, '{', '}')
-            } else {
-                // Type alias — single line
-                i
-            };
-            chunks.push(Chunk {
-                content: join_lines(&lines, decl_start, end),
-                symbol_name: Some(name),
-                symbol_kind: Some(kind),
-                package_name: package_name.clone(),
-                start_line: decl_start + 1,
-                end_line: end + 1,
-            });
-            i = end + 1;
-        } else if trimmed.starts_with("const") || trimmed.starts_with("var") {
-            let is_const = trimmed.starts_with("const");
-            let kind = if is_const {
-                SymbolKind::Const
-            } else {
-                SymbolKind::Var
-            };
-            let (name, end) = if trimmed.contains('(') {
-                (None, find_closing(&lines, i, '(', ')'))
-            } else {
-                let prefix = if is_const { "const " } else { "var " };
-                let after = trimmed.strip_prefix(prefix).unwrap_or("");
-                let name = after.split_whitespace().next().unwrap_or("").to_string();
-                (Some(name), i)
-            };
-            chunks.push(Chunk {
-                content: join_lines(&lines, decl_start, end),
-                symbol_name: name,
-                symbol_kind: Some(kind),
-                package_name: package_name.clone(),
-                start_line: decl_start + 1,
-                end_line: end + 1,
-            });
-            i = end + 1;
-        } else {
-            // Not a recognized top-level declaration; skip the line
-            i += 1;
-        }
     }
 
-    chunks
+    if comments.is_empty() {
+        return content.to_string();
+    }
+
+    comments.reverse();
+    let mut result = comments.join("\n");
+    result.push('\n');
+    result.push_str(content);
+    result
 }
 
-fn is_comment_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with("* ")
-}
+/// Extract a human-readable symbol name from an AST node.
+fn extract_symbol_name(node: Node<'_>, source: &[u8], lang_name: &str) -> Option<String> {
+    // Special case: Rust impl_item -- combine type and trait fields
+    if lang_name == "rust" && node.kind() == "impl_item" {
+        return extract_rust_impl_name(node, source);
+    }
 
-fn join_lines(lines: &[&str], start: usize, end: usize) -> String {
-    lines[start..=end.min(lines.len() - 1)].join("\n")
-}
-
-/// Check whether a brace appears on or after line `start` (within a few lines).
-fn source_contains_brace(lines: &[&str], start: usize) -> bool {
-    // Look at the declaration line and up to 5 continuation lines for an opening brace
-    for (j, line) in lines
-        .iter()
-        .enumerate()
-        .take((start + 6).min(lines.len()))
-        .skip(start)
+    // Special case: Python decorated_definition -- drill into the definition child
+    if lang_name == "python"
+        && node.kind() == "decorated_definition"
+        && let Some(def) = node.child_by_field_name("definition")
     {
-        if line.contains('{') {
-            return true;
-        }
-        if j > start && line.trim().is_empty() {
-            break;
-        }
+        return def
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(|s| s.to_string());
     }
-    false
+
+    // General case: try the "name" field
+    node.child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+        .map(|s| s.to_string())
 }
 
-/// Find the line where `close` balances `open`, starting from `start`.
-fn find_closing(lines: &[&str], start: usize, open: char, close: char) -> usize {
-    let mut depth: i32 = 0;
-    for (j, line) in lines.iter().enumerate().skip(start) {
-        for ch in line.chars() {
-            if ch == open {
-                depth += 1;
-            } else if ch == close {
-                depth -= 1;
-                if depth == 0 {
-                    return j;
-                }
-            }
-        }
-    }
-    // Fallback: end of file
-    lines.len().saturating_sub(1)
-}
+/// Extract `Type` or `Trait for Type` from a Rust impl item.
+fn extract_rust_impl_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let type_node = node.child_by_field_name("type")?;
+    let type_name = type_node.utf8_text(source).ok()?;
 
-/// Parse `func Name(` or `func (r *Type) Name(`.
-fn parse_func_signature(line: &str) -> (String, SymbolKind) {
-    let after_func = line.trim().strip_prefix("func ").unwrap_or("").trim_start();
-
-    if after_func.starts_with('(') {
-        // Method: func (receiver) Name(
-        if let Some(paren_end) = after_func.find(')') {
-            let receiver = &after_func[1..paren_end];
-            let receiver_type = receiver
-                .split_whitespace()
-                .last()
-                .unwrap_or("")
-                .trim_start_matches('*');
-
-            let after_receiver = after_func[paren_end + 1..].trim();
-            let name = after_receiver.split(['(', ' ']).next().unwrap_or("");
-
-            (format!("{receiver_type}.{name}"), SymbolKind::Method)
-        } else {
-            ("unknown".to_string(), SymbolKind::Method)
-        }
+    if let Some(trait_node) = node.child_by_field_name("trait") {
+        let trait_name = trait_node.utf8_text(source).ok()?;
+        Some(format!("{trait_name} for {type_name}"))
     } else {
-        // Function: func Name(
-        let name = after_func.split(['(', ' ', '[']).next().unwrap_or("");
-        (name.to_string(), SymbolKind::Function)
+        Some(type_name.to_string())
     }
-}
-
-/// Parse `type Name struct {` or `type Name interface {`.
-fn parse_type_declaration(line: &str) -> (String, SymbolKind) {
-    let after_type = line.trim().strip_prefix("type ").unwrap_or("").trim();
-    let name = after_type
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string();
-
-    let kind = if after_type.contains("interface") {
-        SymbolKind::Interface
-    } else {
-        SymbolKind::Type
-    };
-
-    (name, kind)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+
+    fn make_chunker(languages: &[&str]) -> TreeSitterChunker {
+        let mut config = Config::load().unwrap();
+        // Keep only requested languages to speed up tests
+        config
+            .lang
+            .retain(|name, _| languages.contains(&name.as_str()));
+        TreeSitterChunker::new(&config).unwrap()
+    }
 
     // ---------------------------------------------------------------
-    // detect_language
+    // Go
     // ---------------------------------------------------------------
 
     #[test]
-    fn detect_language_go() {
-        assert_eq!(detect_language(Path::new("main.go")), Some("go"));
-        assert_eq!(
-            detect_language(Path::new("pkg/server/handler.go")),
-            Some("go")
+    fn go_function_declaration() {
+        let chunker = make_chunker(&["go"]);
+        let source = r#"package main
+
+func hello() {
+	fmt.Println("hello")
+}
+"#;
+        let chunks = chunker.chunk_file(source, "go").unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.symbol_name.as_deref() == Some("hello")
+                    && c.symbol_kind.as_deref() == Some("function_declaration")),
+            "expected function_declaration for hello, got: {chunks:?}"
         );
     }
 
     #[test]
-    fn detect_language_unsupported() {
-        assert_eq!(detect_language(Path::new("main.rs")), None);
-        assert_eq!(detect_language(Path::new("index.js")), None);
-        assert_eq!(detect_language(Path::new("Makefile")), None);
-        assert_eq!(detect_language(Path::new("README.md")), None);
+    fn go_method_declaration() {
+        let chunker = make_chunker(&["go"]);
+        let source = r#"package main
+
+type Server struct{}
+
+func (s *Server) Start() error {
+	return nil
+}
+"#;
+        let chunks = chunker.chunk_file(source, "go").unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.symbol_name.as_deref() == Some("Start")
+                    && c.symbol_kind.as_deref() == Some("method_declaration")),
+            "expected method_declaration for Start, got: {chunks:?}"
+        );
     }
 
     #[test]
-    fn detect_language_no_extension() {
-        assert_eq!(detect_language(Path::new("Dockerfile")), None);
+    fn go_type_declaration() {
+        let chunker = make_chunker(&["go"]);
+        let source = r#"package main
+
+type User struct {
+	Name string
+	Age  int
+}
+"#;
+        let chunks = chunker.chunk_file(source, "go").unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.symbol_kind.as_deref() == Some("type_declaration")),
+            "expected type_declaration, got: {chunks:?}"
+        );
     }
 
-    // ---------------------------------------------------------------
-    // chunk_file dispatch
-    // ---------------------------------------------------------------
+    #[test]
+    fn go_const_and_var() {
+        let chunker = make_chunker(&["go"]);
+        let source = r#"package main
+
+const MaxRetries = 3
+
+var DefaultTimeout = 30
+"#;
+        let chunks = chunker.chunk_file(source, "go").unwrap();
+        let kinds: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| c.symbol_kind.as_deref())
+            .collect();
+        assert!(
+            kinds.contains(&"const_declaration"),
+            "missing const_declaration: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"var_declaration"),
+            "missing var_declaration: {kinds:?}"
+        );
+    }
 
     #[test]
-    fn chunk_file_unknown_language_returns_empty() {
-        let chunks = chunk_file("fn main() {}", "rust");
+    fn go_doc_comments_attached() {
+        let chunker = make_chunker(&["go"]);
+        let source = r#"package main
+
+// Hello prints a greeting.
+func Hello() {
+	fmt.Println("hello")
+}
+"#;
+        let chunks = chunker.chunk_file(source, "go").unwrap();
+        let hello = chunks
+            .iter()
+            .find(|c| c.symbol_name.as_deref() == Some("Hello"))
+            .expect("should find Hello");
+        assert!(
+            hello.content.contains("Hello prints a greeting"),
+            "doc comment should be attached: {:?}",
+            hello.content
+        );
+    }
+
+    #[test]
+    fn go_line_numbers_are_1_indexed() {
+        let chunker = make_chunker(&["go"]);
+        let source = "package main\n\nfunc Hello() {\n\tfmt.Println(\"hello\")\n}\n";
+        let chunks = chunker.chunk_file(source, "go").unwrap();
+        let hello = chunks
+            .iter()
+            .find(|c| c.symbol_name.as_deref() == Some("Hello"))
+            .expect("should find Hello");
+        assert_eq!(hello.start_line, 3);
+        assert_eq!(hello.end_line, 5);
+    }
+
+    #[test]
+    fn go_empty_file() {
+        let chunker = make_chunker(&["go"]);
+        let chunks = chunker.chunk_file("", "go").unwrap();
         assert!(chunks.is_empty());
     }
 
     #[test]
-    fn chunk_file_dispatches_to_go() {
-        let chunks = chunk_file("package main\n", "go");
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].symbol_kind, Some(SymbolKind::Package));
-    }
-
-    // ---------------------------------------------------------------
-    // Real-world Go file with mixed declarations
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn chunk_go_realistic_http_handler() {
+    fn go_realistic_http_handler() {
+        let chunker = make_chunker(&["go"]);
         let source = r#"package api
 
 import (
@@ -335,484 +347,267 @@ import (
 	"net/http"
 )
 
-// UserService handles user-related operations.
+// UserService handles user operations.
 type UserService struct {
 	db    *sql.DB
 	cache *redis.Client
 }
 
 // NewUserService creates a new UserService.
-func NewUserService(db *sql.DB, cache *redis.Client) *UserService {
-	return &UserService{
-		db:    db,
-		cache: cache,
-	}
+func NewUserService(db *sql.DB) *UserService {
+	return &UserService{db: db}
 }
 
 // GetUser returns a user by ID.
 func (s *UserService) GetUser(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
-		return
-	}
-
-	user, err := s.db.Query("SELECT * FROM users WHERE id = ?", id)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	json.NewEncoder(w).Encode(user)
-}
-
-// DeleteUser removes a user by ID.
-func (s *UserService) DeleteUser(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	_, err := s.db.Exec("DELETE FROM users WHERE id = ?", id)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	json.NewEncoder(w).Encode("user")
 }
 "#;
-        let chunks = chunk_file(source, "go");
-
-        // Should extract: package, import, type, NewUserService, GetUser, DeleteUser
-        assert_eq!(chunks.len(), 6);
-
-        // Package
-        assert_eq!(chunks[0].symbol_name.as_deref(), Some("api"));
-        assert_eq!(chunks[0].symbol_kind, Some(SymbolKind::Package));
-        assert_eq!(chunks[0].start_line, 1);
-        assert_eq!(chunks[0].end_line, 1);
-
-        // Multi-line import block
-        assert_eq!(chunks[1].symbol_kind, Some(SymbolKind::Import));
-        assert!(chunks[1].content.contains("encoding/json"));
-        assert!(chunks[1].content.contains("net/http"));
-        assert_eq!(chunks[1].start_line, 3);
-        assert_eq!(chunks[1].end_line, 6);
-
-        // Type with doc comment
-        assert_eq!(chunks[2].symbol_name.as_deref(), Some("UserService"));
-        assert_eq!(chunks[2].symbol_kind, Some(SymbolKind::Type));
-        assert!(chunks[2].content.contains("UserService handles"));
-
-        // Constructor function with doc comment
-        assert_eq!(chunks[3].symbol_name.as_deref(), Some("NewUserService"));
-        assert_eq!(chunks[3].symbol_kind, Some(SymbolKind::Function));
-        assert!(chunks[3].content.contains("NewUserService creates"));
-
-        // GetUser method with doc comment
-        assert_eq!(
-            chunks[4].symbol_name.as_deref(),
-            Some("UserService.GetUser")
-        );
-        assert_eq!(chunks[4].symbol_kind, Some(SymbolKind::Method));
-        assert!(chunks[4].content.contains("GetUser returns a user"));
-
-        // DeleteUser method with doc comment
-        assert_eq!(
-            chunks[5].symbol_name.as_deref(),
-            Some("UserService.DeleteUser")
-        );
-        assert_eq!(chunks[5].symbol_kind, Some(SymbolKind::Method));
-        assert!(chunks[5].content.contains("DeleteUser removes"));
-    }
-
-    // ---------------------------------------------------------------
-    // Interface declarations
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn chunk_go_interface() {
-        let source = r#"package storage
-
-// Store is the main storage interface.
-type Store interface {
-	Get(key string) ([]byte, error)
-	Set(key string, value []byte) error
-	Delete(key string) error
-}
-
-type ReadOnlyStore interface {
-	Get(key string) ([]byte, error)
-}
-"#;
-        let chunks = chunk_file(source, "go");
-
-        // package + 2 interfaces
-        assert_eq!(chunks.len(), 3);
-
-        assert_eq!(chunks[1].symbol_name.as_deref(), Some("Store"));
-        assert_eq!(chunks[1].symbol_kind, Some(SymbolKind::Interface));
-        assert!(chunks[1].content.contains("Store is the main"));
-        assert!(chunks[1].content.contains("Delete(key string) error"));
-
-        assert_eq!(chunks[2].symbol_name.as_deref(), Some("ReadOnlyStore"));
-        assert_eq!(chunks[2].symbol_kind, Some(SymbolKind::Interface));
-    }
-
-    // ---------------------------------------------------------------
-    // Nested braces in function bodies
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn chunk_go_nested_braces() {
-        let source = r#"package main
-
-func Process(items []string) map[string]int {
-	result := make(map[string]int)
-	for _, item := range items {
-		if len(item) > 0 {
-			for _, ch := range item {
-				result[string(ch)]++
-			}
-		}
-	}
-	return result
-}
-"#;
-        let chunks = chunk_file(source, "go");
-        assert_eq!(chunks.len(), 2); // package + function
-
-        let func_chunk = &chunks[1];
-        assert_eq!(func_chunk.symbol_name.as_deref(), Some("Process"));
-        // The whole function body should be captured, not cut off at the first }
-        assert!(func_chunk.content.contains("return result"));
-        assert!(func_chunk.content.contains("result[string(ch)]++"));
-    }
-
-    // ---------------------------------------------------------------
-    // Const and var declarations
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn chunk_go_single_const() {
-        let source = "package config\n\nconst MaxRetries = 3\n";
-        let chunks = chunk_file(source, "go");
-        assert_eq!(chunks.len(), 2);
-
-        assert_eq!(chunks[1].symbol_kind, Some(SymbolKind::Const));
-        assert_eq!(chunks[1].symbol_name.as_deref(), Some("MaxRetries"));
-        assert!(chunks[1].content.contains("MaxRetries = 3"));
-    }
-
-    #[test]
-    fn chunk_go_grouped_const_with_iota() {
-        let source = r#"package status
-
-const (
-	StatusPending = iota
-	StatusRunning
-	StatusDone
-	StatusFailed
-)
-"#;
-        let chunks = chunk_file(source, "go");
-        assert_eq!(chunks.len(), 2);
-
-        let const_chunk = &chunks[1];
-        assert_eq!(const_chunk.symbol_kind, Some(SymbolKind::Const));
-        assert!(const_chunk.content.contains("StatusPending"));
-        assert!(const_chunk.content.contains("StatusFailed"));
-    }
-
-    #[test]
-    fn chunk_go_var_declarations() {
-        let source = r#"package globals
-
-var DefaultTimeout = 30
-
-var (
-	ErrNotFound  = errors.New("not found")
-	ErrForbidden = errors.New("forbidden")
-)
-"#;
-        let chunks = chunk_file(source, "go");
-        assert_eq!(chunks.len(), 3); // package + single var + grouped var
-
-        assert_eq!(chunks[1].symbol_kind, Some(SymbolKind::Var));
-        assert_eq!(chunks[1].symbol_name.as_deref(), Some("DefaultTimeout"));
-
-        assert_eq!(chunks[2].symbol_kind, Some(SymbolKind::Var));
-        // Grouped var has no single name
-        assert!(chunks[2].content.contains("ErrNotFound"));
-        assert!(chunks[2].content.contains("ErrForbidden"));
-    }
-
-    // ---------------------------------------------------------------
-    // Type aliases and definitions
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn chunk_go_type_alias() {
-        let source = "package types\n\ntype UserID string\n\ntype Score float64\n";
-        let chunks = chunk_file(source, "go");
-        assert_eq!(chunks.len(), 3);
-
-        assert_eq!(chunks[1].symbol_name.as_deref(), Some("UserID"));
-        assert_eq!(chunks[1].symbol_kind, Some(SymbolKind::Type));
-
-        assert_eq!(chunks[2].symbol_name.as_deref(), Some("Score"));
-        assert_eq!(chunks[2].symbol_kind, Some(SymbolKind::Type));
-    }
-
-    // ---------------------------------------------------------------
-    // Line numbers
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn chunk_go_line_numbers_are_1_indexed() {
-        let source = r#"package main
-
-import "fmt"
-
-func Hello() {
-	fmt.Println("hello")
-}
-"#;
-        let chunks = chunk_file(source, "go");
-
-        // package on line 1
-        assert_eq!(chunks[0].start_line, 1);
-        assert_eq!(chunks[0].end_line, 1);
-
-        // import on line 3
-        assert_eq!(chunks[1].start_line, 3);
-        assert_eq!(chunks[1].end_line, 3);
-
-        // func on lines 5-7
-        assert_eq!(chunks[2].start_line, 5);
-        assert_eq!(chunks[2].end_line, 7);
-    }
-
-    // ---------------------------------------------------------------
-    // Doc comments are attached to their declaration
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn chunk_go_doc_comments_attached() {
-        let source = r#"package pkg
-
-// Config holds application configuration.
-// It is loaded from environment variables.
-type Config struct {
-	Port int
-	Host string
-}
-
-// NewConfig creates a Config from the environment.
-func NewConfig() *Config {
-	return &Config{Port: 8080, Host: "localhost"}
-}
-"#;
-        let chunks = chunk_file(source, "go");
-
-        let type_chunk = &chunks[1];
-        assert!(type_chunk.content.contains("Config holds application"));
-        assert!(type_chunk.content.contains("loaded from environment"));
-        assert!(type_chunk.content.contains("type Config struct"));
-
-        let func_chunk = &chunks[2];
-        assert!(func_chunk.content.contains("NewConfig creates"));
-        assert!(func_chunk.content.contains("func NewConfig"));
-    }
-
-    // ---------------------------------------------------------------
-    // Empty and minimal files
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn chunk_go_empty_file() {
-        let chunks = chunk_file("", "go");
-        assert!(chunks.is_empty());
-    }
-
-    #[test]
-    fn chunk_go_package_only() {
-        let chunks = chunk_file("package main\n", "go");
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].symbol_kind, Some(SymbolKind::Package));
-    }
-
-    #[test]
-    fn chunk_go_comments_only() {
-        let source = "// This file is intentionally left blank.\n// Nothing here.\n";
-        let chunks = chunk_file(source, "go");
-        assert!(chunks.is_empty());
-    }
-
-    // ---------------------------------------------------------------
-    // Single-line import
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn chunk_go_single_import() {
-        let source = "package main\n\nimport \"fmt\"\n";
-        let chunks = chunk_file(source, "go");
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[1].symbol_kind, Some(SymbolKind::Import));
-        assert!(chunks[1].content.contains("\"fmt\""));
-    }
-
-    // ---------------------------------------------------------------
-    // Method with value receiver
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn chunk_go_value_receiver_method() {
-        let source = r#"package point
-
-type Point struct {
-	X, Y float64
-}
-
-func (p Point) Distance() float64 {
-	return math.Sqrt(p.X*p.X + p.Y*p.Y)
-}
-"#;
-        let chunks = chunk_file(source, "go");
-        let method = &chunks[2];
-        assert_eq!(method.symbol_name.as_deref(), Some("Point.Distance"));
-        assert_eq!(method.symbol_kind, Some(SymbolKind::Method));
-    }
-
-    // ---------------------------------------------------------------
-    // Package name propagates to all chunks
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn chunk_go_package_name_propagated() {
-        let source = r#"package mypackage
-
-import "os"
-
-func DoWork() error {
-	return nil
-}
-"#;
-        let chunks = chunk_file(source, "go");
-        for chunk in &chunks {
-            assert_eq!(
-                chunk.package_name.as_deref(),
-                Some("mypackage"),
-                "chunk {:?} should have package_name=mypackage",
-                chunk.symbol_kind
-            );
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // Multiple methods on the same type
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn chunk_go_multiple_methods_same_type() {
-        let source = r#"package db
-
-type Conn struct {
-	url string
-}
-
-func (c *Conn) Open() error {
-	return nil
-}
-
-func (c *Conn) Close() error {
-	return nil
-}
-
-func (c *Conn) Ping() error {
-	return nil
-}
-"#;
-        let chunks = chunk_file(source, "go");
-
-        let methods: Vec<_> = chunks
+        let chunks = chunker.chunk_file(source, "go").unwrap();
+        let names: Vec<_> = chunks
             .iter()
-            .filter(|c| c.symbol_kind == Some(SymbolKind::Method))
+            .filter_map(|c| c.symbol_name.as_deref())
             .collect();
-
-        assert_eq!(methods.len(), 3);
-        assert_eq!(methods[0].symbol_name.as_deref(), Some("Conn.Open"));
-        assert_eq!(methods[1].symbol_name.as_deref(), Some("Conn.Close"));
-        assert_eq!(methods[2].symbol_name.as_deref(), Some("Conn.Ping"));
+        assert!(
+            names.contains(&"NewUserService"),
+            "missing NewUserService: {names:?}"
+        );
+        assert!(names.contains(&"GetUser"), "missing GetUser: {names:?}");
     }
 
     // ---------------------------------------------------------------
-    // Generic function (Go 1.18+)
+    // Rust
     // ---------------------------------------------------------------
 
     #[test]
-    fn chunk_go_generic_function() {
-        let source = r#"package slices
-
-func Map[T any, U any](s []T, f func(T) U) []U {
-	result := make([]U, len(s))
-	for i, v := range s {
-		result[i] = f(v)
-	}
-	return result
+    fn rust_function_item() {
+        let chunker = make_chunker(&["rust"]);
+        let source = r#"fn main() {
+    println!("hello");
 }
 "#;
-        let chunks = chunk_file(source, "go");
-        assert_eq!(chunks.len(), 2);
+        let chunks = chunker.chunk_file(source, "rust").unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.symbol_name.as_deref() == Some("main")
+                    && c.symbol_kind.as_deref() == Some("function_item")),
+            "expected function_item for main, got: {chunks:?}"
+        );
+    }
 
-        let func_chunk = &chunks[1];
-        assert_eq!(func_chunk.symbol_name.as_deref(), Some("Map"));
-        assert_eq!(func_chunk.symbol_kind, Some(SymbolKind::Function));
-        assert!(func_chunk.content.contains("return result"));
+    #[test]
+    fn rust_struct_and_impl() {
+        let chunker = make_chunker(&["rust"]);
+        let source = r#"struct Point {
+    x: f64,
+    y: f64,
+}
+
+impl Point {
+    fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
+
+    fn distance(&self) -> f64 {
+        (self.x * self.x + self.y * self.y).sqrt()
+    }
+}
+"#;
+        let chunks = chunker.chunk_file(source, "rust").unwrap();
+        let kinds: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| c.symbol_kind.as_deref())
+            .collect();
+        assert!(
+            kinds.contains(&"struct_item"),
+            "missing struct_item: {kinds:?}"
+        );
+        assert!(kinds.contains(&"impl_item"), "missing impl_item: {kinds:?}");
+        // Methods inside impl are also extracted as function_item
+        assert!(
+            kinds.contains(&"function_item"),
+            "missing function_item: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn rust_impl_name_extraction() {
+        let chunker = make_chunker(&["rust"]);
+        let source = r#"struct Foo;
+
+impl Foo {
+    fn bar(&self) {}
+}
+"#;
+        let chunks = chunker.chunk_file(source, "rust").unwrap();
+        let impl_chunk = chunks
+            .iter()
+            .find(|c| c.symbol_kind.as_deref() == Some("impl_item"))
+            .expect("should find impl_item");
+        assert_eq!(impl_chunk.symbol_name.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn rust_trait_impl_name() {
+        let chunker = make_chunker(&["rust"]);
+        let source = r#"struct Foo;
+
+impl Display for Foo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Foo")
+    }
+}
+"#;
+        let chunks = chunker.chunk_file(source, "rust").unwrap();
+        let impl_chunk = chunks
+            .iter()
+            .find(|c| c.symbol_kind.as_deref() == Some("impl_item"))
+            .expect("should find impl_item");
+        assert_eq!(impl_chunk.symbol_name.as_deref(), Some("Display for Foo"));
+    }
+
+    #[test]
+    fn rust_enum_and_trait() {
+        let chunker = make_chunker(&["rust"]);
+        let source = r#"enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+trait Drawable {
+    fn draw(&self);
+}
+"#;
+        let chunks = chunker.chunk_file(source, "rust").unwrap();
+        let kinds: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| c.symbol_kind.as_deref())
+            .collect();
+        assert!(kinds.contains(&"enum_item"), "missing enum_item: {kinds:?}");
+        assert!(
+            kinds.contains(&"trait_item"),
+            "missing trait_item: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn rust_doc_comments_attached() {
+        let chunker = make_chunker(&["rust"]);
+        let source = r#"/// Adds two numbers.
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+"#;
+        let chunks = chunker.chunk_file(source, "rust").unwrap();
+        let add = chunks
+            .iter()
+            .find(|c| c.symbol_name.as_deref() == Some("add"))
+            .expect("should find add");
+        assert!(
+            add.content.contains("Adds two numbers"),
+            "doc comment should be attached: {:?}",
+            add.content
+        );
     }
 
     // ---------------------------------------------------------------
-    // Struct with embedded fields and tags
+    // Python
     // ---------------------------------------------------------------
 
     #[test]
-    fn chunk_go_struct_with_tags() {
-        let source = r#"package model
-
-type User struct {
-	ID        int64  `json:"id" db:"id"`
-	Name      string `json:"name" db:"name"`
-	Email     string `json:"email" db:"email"`
-	CreatedAt time.Time `json:"created_at" db:"created_at"`
-	sync.Mutex
-}
+    fn python_function_definition() {
+        let chunker = make_chunker(&["python"]);
+        let source = r#"def hello():
+    print("hello")
 "#;
-        let chunks = chunk_file(source, "go");
-        let type_chunk = &chunks[1];
-        assert_eq!(type_chunk.symbol_name.as_deref(), Some("User"));
-        assert!(type_chunk.content.contains("sync.Mutex"));
-        assert!(type_chunk.content.contains("`json:\"id\""));
+        let chunks = chunker.chunk_file(source, "python").unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.symbol_name.as_deref() == Some("hello")
+                    && c.symbol_kind.as_deref() == Some("function_definition")),
+            "expected function_definition for hello, got: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn python_class_definition() {
+        let chunker = make_chunker(&["python"]);
+        let source = r#"class User:
+    def __init__(self, name):
+        self.name = name
+
+    def greet(self):
+        return f"Hello, {self.name}"
+"#;
+        let chunks = chunker.chunk_file(source, "python").unwrap();
+        let kinds: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| c.symbol_kind.as_deref())
+            .collect();
+        assert!(
+            kinds.contains(&"class_definition"),
+            "missing class_definition: {kinds:?}"
+        );
+        // Methods inside classes are also extracted
+        assert!(
+            kinds.contains(&"function_definition"),
+            "missing function_definition: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn python_decorated_function() {
+        let chunker = make_chunker(&["python"]);
+        let source = r#"@app.route("/users")
+def list_users():
+    return []
+"#;
+        let chunks = chunker.chunk_file(source, "python").unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.symbol_kind.as_deref() == Some("decorated_definition")),
+            "expected decorated_definition, got: {chunks:?}"
+        );
+        let decorated = chunks
+            .iter()
+            .find(|c| c.symbol_kind.as_deref() == Some("decorated_definition"))
+            .unwrap();
+        assert_eq!(
+            decorated.symbol_name.as_deref(),
+            Some("list_users"),
+            "decorated_definition should extract inner function name"
+        );
+    }
+
+    #[test]
+    fn python_nested_class_methods() {
+        let chunker = make_chunker(&["python"]);
+        let source = r#"class Outer:
+    class Inner:
+        def method(self):
+            pass
+"#;
+        let chunks = chunker.chunk_file(source, "python").unwrap();
+        // Should get: Outer (class), Inner (class, nested), method (function)
+        assert!(
+            chunks.len() >= 3,
+            "expected at least 3 chunks (Outer, Inner, method), got {}",
+            chunks.len()
+        );
     }
 
     // ---------------------------------------------------------------
-    // Function with closure containing braces
+    // Cross-cutting
     // ---------------------------------------------------------------
 
     #[test]
-    fn chunk_go_function_with_closure() {
-        let source = r#"package main
-
-func RunServer() {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" {
-			w.WriteHeader(200)
-		} else {
-			w.WriteHeader(405)
-		}
-	})
-	http.ListenAndServe(":8080", nil)
-}
-"#;
-        let chunks = chunk_file(source, "go");
-        let func_chunk = &chunks[1];
-        assert_eq!(func_chunk.symbol_name.as_deref(), Some("RunServer"));
-        // Must capture the entire function including the closure
-        assert!(func_chunk.content.contains("ListenAndServe"));
+    fn unknown_language_returns_error() {
+        let chunker = make_chunker(&["go"]);
+        let result = chunker.chunk_file("console.log('hi')", "javascript");
+        assert!(result.is_err());
     }
 }

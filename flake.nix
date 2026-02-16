@@ -39,16 +39,8 @@
     }:
     flake-utils.lib.eachDefaultSystem (localSystem:
     let
-      # Derive the musl cross-target from the build architecture so the
-      # same flake works on both x86_64 and aarch64 hosts.
-      arch = builtins.head (builtins.split "-" localSystem);
-      crossSystem = {
-        config = "${arch}-unknown-linux-musl";
-        useLLVM = false;
-      };
-
       pkgs = import nixpkgs {
-        inherit localSystem crossSystem;
+        inherit localSystem;
         overlays = [
           fenix.overlays.default
           gitignore.overlay
@@ -65,16 +57,11 @@
                 fenixPackages.stable.rustfmt
                 fenixPackages.minimal.cargo
                 fenixPackages.minimal.rustc
-                final.fenix.targets.${crossSystem.config}.stable.rust-std
               ];
-
-            rustStdenv = final.pkgsBuildHost.llvmPackages_18.stdenv;
-            rustLinker = final.pkgsBuildHost.llvmPackages_18.lld;
 
             naerskBuild = (naersk.lib.${localSystem}.override {
               cargo = final.rustToolchain;
               rustc = final.rustToolchain;
-              stdenv = final.rustStdenv;
             }).buildPackage;
           })
         ];
@@ -82,24 +69,29 @@
 
       inherit (pkgs.lib) mkForce;
 
-      # Shared naersk args for the musl cross-build. Used by both the
-      # package (no tests) and the check (with tests).
+      fenixPackages = fenix.packages.${localSystem};
+
+      # Nightly toolchain for cargo-udeps (which requires unstable features).
+      # Wrapped so nightly doesn't leak into the normal dev PATH.
+      nightlyToolchain = fenixPackages.latest.toolchain;
+      cargoUdeps = pkgs.writeShellApplication {
+        name = "cargo-udeps";
+        text = ''
+          PATH="${nightlyToolchain}/bin:$PATH" exec ${pkgs.cargo-udeps}/bin/cargo-udeps "$@"
+        '';
+      };
+
+      # Native build (no musl cross-compilation). wasmtime (used by
+      # tree-sitter's wasm feature) does not cross-compile cleanly to musl.
+      # Static linking can be revisited once wasmtime supports it.
       naerskArgs = {
         pname = "claudevil";
         src = pkgs.gitignoreSource ./.;
 
         nativeBuildInputs = with pkgs; [
-          pkgsBuildBuild.pkg-config
-          rustStdenv.cc
-          rustLinker
+          pkg-config
+          stdenv.cc
         ];
-
-        hardeningDisable = [ "fortify" ];
-
-        CARGO_BUILD_TARGET = crossSystem.config;
-        # Point the linker at the cross-GCC's static libstdc++ so usearch's
-        # C++ runtime symbols (operator new, __cxa_guard_*, exceptions) resolve.
-        RUSTFLAGS = "-C linker-flavor=ld.lld -C target-feature=+crt-static -L ${pkgs.stdenv.cc.cc}/${crossSystem.config}/lib";
       };
     in
     rec {
@@ -107,15 +99,15 @@
 
       packages.default = packages.claudevil;
 
-      packages.site = pkgs.pkgsBuildBuild.stdenv.mkDerivation {
+      packages.site = pkgs.stdenv.mkDerivation {
         name = "claudevil-site";
         src = ./site;
-        nativeBuildInputs = [ pkgs.pkgsBuildBuild.zola ];
+        nativeBuildInputs = [ pkgs.zola ];
         buildPhase = "zola build";
         installPhase = "cp -r public $out";
       };
 
-      packages.container = pkgs.pkgsBuildBuild.dockerTools.buildLayeredImage {
+      packages.container = pkgs.dockerTools.buildLayeredImage {
         name = "claudevil";
         tag = "latest";
         contents = [ packages.claudevil ];
@@ -128,9 +120,9 @@
 
       apps.site = {
         type = "app";
-        program = "${pkgs.pkgsBuildBuild.writeShellApplication {
+        program = "${pkgs.writeShellApplication {
           name = "claudevil-site-serve";
-          runtimeInputs = [pkgs.pkgsBuildBuild.zola];
+          runtimeInputs = [ pkgs.zola ];
           text = ''
             exec zola --root site serve "$@"
           '';
@@ -139,9 +131,9 @@
 
       apps.trufflehog = {
         type = "app";
-        program = "${pkgs.pkgsBuildBuild.writeShellApplication {
+        program = "${pkgs.writeShellApplication {
           name = "claudevil-trufflehog";
-          runtimeInputs = [pkgs.pkgsBuildBuild.trufflehog];
+          runtimeInputs = [ pkgs.trufflehog ];
           text = ''
             exec trufflehog git "file://$(git rev-parse --show-toplevel)" --since-commit HEAD --fail "$@"
           '';
@@ -150,9 +142,9 @@
 
       apps.audit = {
         type = "app";
-        program = "${pkgs.pkgsBuildBuild.writeShellApplication {
+        program = "${pkgs.writeShellApplication {
           name = "claudevil-audit";
-          runtimeInputs = [pkgs.pkgsBuildBuild.cargo-audit];
+          runtimeInputs = [ pkgs.cargo-audit ];
           text = ''
             exec cargo-audit audit "$@"
           '';
@@ -160,18 +152,7 @@
       };
 
       checks = {
-        # Build + test with the musl cross-toolchain, then verify the
-        # resulting binary is statically linked.
-        claudevil =
-          let
-            built = pkgs.naerskBuild (naerskArgs // { doCheck = true; });
-          in
-          pkgs.pkgsBuildBuild.runCommand "claudevil-static-check" { } ''
-            ${pkgs.pkgsBuildBuild.file}/bin/file ${built}/bin/claudevil \
-              | tee /dev/stderr \
-              | grep -qE "statically linked|static-pie linked"
-            touch $out
-          '';
+        claudevil = pkgs.naerskBuild (naerskArgs // { doCheck = true; });
 
         pre-commit-check = pre-commit-hooks.lib.${localSystem}.run {
           src = ./.;
@@ -184,28 +165,35 @@
 
             shfmt = {
               enable = true;
-              entry = mkForce "${pkgs.pkgsBuildBuild.shfmt}/bin/shfmt -i 2 -sr -d -s -l";
+              entry = mkForce "${pkgs.shfmt}/bin/shfmt -i 2 -sr -d -s -l";
               files = "\\.sh$";
             };
 
             rustfmt = {
               enable = true;
-              entry = mkForce "${pkgs.pkgsBuildBuild.rustToolchain}/bin/cargo fmt -- --check --color=always";
+              entry = mkForce "${pkgs.rustToolchain}/bin/cargo fmt -- --check --color=always";
             };
 
             clippy = {
               enable = true;
-              entry = mkForce "${pkgs.pkgsBuildBuild.rustToolchain}/bin/cargo clippy -- -D warnings";
+              entry = mkForce "${pkgs.rustToolchain}/bin/cargo clippy -- -D warnings";
             };
 
             cargo-check = {
               enable = true;
-              entry = mkForce "${pkgs.pkgsBuildBuild.rustToolchain}/bin/cargo check";
+              entry = mkForce "${pkgs.rustToolchain}/bin/cargo check";
+            };
+
+            cargo-udeps = {
+              enable = true;
+              entry = mkForce "${cargoUdeps}/bin/cargo-udeps udeps --all-targets";
+              pass_filenames = false;
+              types = [ "rust" ];
             };
 
             taplo = {
               enable = true;
-              entry = mkForce "${pkgs.pkgsBuildBuild.taplo}/bin/taplo fmt";
+              entry = mkForce "${pkgs.taplo}/bin/taplo fmt";
               types = [ "toml" ];
             };
           };
@@ -213,31 +201,26 @@
       };
 
       devShells.default = pkgs.mkShell {
-        nativeBuildInputs = (with pkgs.pkgsBuildBuild; [
-          rustToolchain
-          actionlint
-          cargo-audit
-          cargo-llvm-cov
-          pkg-config
-          cacert
-          deadnix
-          git
-          nixpkgs-fmt
-          statix
-          taplo
-          trufflehog
-          zola
-        ]) ++ [
-          # Musl-targeting clang and lld — same toolchain as the nix build.
-          pkgs.rustStdenv.cc
-          pkgs.rustLinker
+        nativeBuildInputs = [
+          pkgs.rustToolchain
+          cargoUdeps
+          pkgs.actionlint
+          pkgs.cargo-audit
+          pkgs.cargo-llvm-cov
+          pkgs.pkg-config
+          pkgs.cacert
+          pkgs.deadnix
+          pkgs.git
+          pkgs.nixpkgs-fmt
+          pkgs.statix
+          pkgs.taplo
+          pkgs.trufflehog
+          pkgs.zola
+          pkgs.nodejs
         ];
 
-        hardeningDisable = [ "fortify" ];
-
-        # Always target musl so cargo build/test/clippy produce static binaries.
-        CARGO_BUILD_TARGET = crossSystem.config;
-        RUSTFLAGS = "-C linker-flavor=ld.lld -C target-feature=+crt-static -L ${pkgs.stdenv.cc.cc}/${crossSystem.config}/lib";
+        # usearch links against C++ — ensure libstdc++ is available at runtime
+        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ];
 
         inherit (self.checks.${localSystem}.pre-commit-check) shellHook;
       };

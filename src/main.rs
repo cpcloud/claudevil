@@ -1,4 +1,5 @@
 mod chunker;
+mod config;
 mod embed;
 mod error;
 mod indexer;
@@ -6,6 +7,7 @@ mod server;
 mod store;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use directories::BaseDirs;
@@ -32,6 +34,15 @@ async fn main() -> Result<()> {
 
     tracing::info!("claudevil starting for: {}", root.display());
 
+    // Load config (uses hardcoded defaults if no config file exists)
+    let config = config::Config::load().context("failed to load config")?;
+    let languages = config.language_names().join(", ");
+    tracing::info!("configured languages: {languages}");
+
+    // Initialize tree-sitter chunker (grammars load lazily on first use)
+    let chunker =
+        Arc::new(chunker::TreeSitterChunker::new(&config).context("failed to initialize chunker")?);
+
     // Determine platform-appropriate data directory
     let base_dirs = BaseDirs::new().context("could not determine data directory")?;
     let db_path = base_dirs
@@ -55,7 +66,12 @@ async fn main() -> Result<()> {
     .context("failed to open vector store")?;
 
     // Index files in the background so the MCP server is available immediately
-    let indexer = indexer::Indexer::new(embedder.clone(), store.clone());
+    let indexer = indexer::Indexer::new(
+        embedder.clone(),
+        store.clone(),
+        chunker.clone(),
+        config.clone(),
+    );
     let index_root = root.clone();
     tokio::spawn(async move {
         if let Err(e) = indexer.index_directory(&index_root).await {
@@ -64,7 +80,7 @@ async fn main() -> Result<()> {
     });
 
     // Start MCP server over stdio
-    let mcp_server = server::ClaudevilServer::new(embedder, store, root);
+    let mcp_server = server::ClaudevilServer::new(embedder, store, chunker, config, root);
     tracing::info!("MCP server starting on stdio");
 
     let service = mcp_server

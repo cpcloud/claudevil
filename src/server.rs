@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -6,6 +7,8 @@ use rmcp::model::*;
 use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 
+use crate::chunker::TreeSitterChunker;
+use crate::config::Config;
 use crate::embed::Embedder;
 use crate::indexer::Indexer;
 use crate::store::VectorStore;
@@ -14,7 +17,7 @@ use crate::store::VectorStore;
 pub struct SearchParams {
     /// Natural language search query describing what you're looking for.
     pub query: String,
-    /// Filter by programming language (e.g. "go"). If omitted, searches all languages.
+    /// Filter by programming language (e.g. "go", "rust", "python"). If omitted, searches all languages.
     pub language: Option<String>,
     /// Maximum number of results to return (default: 10).
     pub limit: Option<usize>,
@@ -27,7 +30,7 @@ pub struct IndexStatusParams {}
 pub struct FindSymbolParams {
     /// Symbol name to search for (case-insensitive substring match).
     pub name: String,
-    /// Filter by symbol kind (e.g. "func", "method", "type", "interface").
+    /// Filter by symbol kind (e.g. "function_declaration", "struct_item", "class_definition").
     pub kind: Option<String>,
     /// Maximum number of results to return (default: 20).
     pub limit: Option<usize>,
@@ -35,7 +38,7 @@ pub struct FindSymbolParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListFilesParams {
-    /// Filter by programming language (e.g. "go"). If omitted, lists all indexed files.
+    /// Filter by programming language (e.g. "go", "rust", "python"). If omitted, lists all indexed files.
     pub language: Option<String>,
 }
 
@@ -52,7 +55,7 @@ pub struct ReindexParams {}
 pub struct FindSimilarParams {
     /// Code snippet to find similar chunks for.
     pub code: String,
-    /// Filter by programming language (e.g. "go"). If omitted, searches all languages.
+    /// Filter by programming language (e.g. "go", "rust", "python"). If omitted, searches all languages.
     pub language: Option<String>,
     /// Maximum number of results to return (default: 10).
     pub limit: Option<usize>,
@@ -62,6 +65,8 @@ pub struct FindSimilarParams {
 pub struct ClaudevilServer {
     embedder: Embedder,
     store: VectorStore,
+    chunker: Arc<TreeSitterChunker>,
+    config: Config,
     root: PathBuf,
     tool_router: ToolRouter<Self>,
 }
@@ -99,10 +104,18 @@ fn format_results(results: &[crate::store::SearchResult], show_distance: bool) -
 
 #[tool_router]
 impl ClaudevilServer {
-    pub fn new(embedder: Embedder, store: VectorStore, root: PathBuf) -> Self {
+    pub fn new(
+        embedder: Embedder,
+        store: VectorStore,
+        chunker: Arc<TreeSitterChunker>,
+        config: Config,
+        root: PathBuf,
+    ) -> Self {
         Self {
             embedder,
             store,
+            chunker,
+            config,
             root,
             tool_router: Self::tool_router(),
         }
@@ -153,8 +166,9 @@ impl ClaudevilServer {
             .await
             .map_err(|e| McpError::internal_error(format!("count failed: {e}"), None))?;
 
+        let languages = self.config.language_names().join(", ");
         let status = format!(
-            "Root: {}\nChunks indexed: {count}\nSupported languages: go",
+            "Root: {}\nChunks indexed: {count}\nSupported languages: {languages}",
             self.root.display()
         );
 
@@ -249,7 +263,12 @@ impl ClaudevilServer {
         &self,
         Parameters(_params): Parameters<ReindexParams>,
     ) -> Result<CallToolResult, McpError> {
-        let indexer = Indexer::new(self.embedder.clone(), self.store.clone());
+        let indexer = Indexer::new(
+            self.embedder.clone(),
+            self.store.clone(),
+            self.chunker.clone(),
+            self.config.clone(),
+        );
         let root = self.root.clone();
         tokio::spawn(async move {
             if let Err(e) = indexer.index_directory(&root).await {

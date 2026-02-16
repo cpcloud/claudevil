@@ -38,6 +38,12 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    #[error("config error: {0}")]
+    Config(String),
+
+    #[error("tree-sitter error: {0}")]
+    TreeSitter(String),
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 
