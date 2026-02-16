@@ -81,9 +81,6 @@
         '';
       };
 
-      # Native build (no musl cross-compilation). wasmtime (used by
-      # tree-sitter's wasm feature) does not cross-compile cleanly to musl.
-      # Static linking can be revisited once wasmtime supports it.
       naerskArgs = {
         pname = "claudevil";
         src = pkgs.gitignoreSource ./.;
