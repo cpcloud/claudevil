@@ -16,8 +16,5 @@ jobs:
           persist-credentials: false
       - uses: DeterminateSystems/determinate-nix-action@89ab342bd48ff7318caf8d39d6a330c7b1df8f2f # v3
 
-      - name: Build static binary
-        run: nix build .#claudevil
-
-      - name: Verify static linking
-        run: file result/bin/claudevil && ldd result/bin/claudevil || true
+      - name: Build
+        run: nix build '.#claudevil'
